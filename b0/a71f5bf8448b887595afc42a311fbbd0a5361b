@@ -1,0 +1,50 @@
+NOTICE
+  h_73cfd908b059c1 1-5
+README.md
+  h_73cfd908b059c1 1,3-4,6-21,23,25-29,31,35-36,39,41-44,47-49,52-53,55-59,61,63-66,68-75,78,81,84,86-88,90,92-98,101,103-105,107,109,111-113,115,117-133,135
+package-lock.json
+  h_73cfd908b059c1 2,8,12,16,289-291,297-304,313-315,326-328,339-341,355-357,371-373,387-389,403-405,416-418
+package.json
+  h_73cfd908b059c1 2,5,9,33,36-37,47
+scripts/codex-shim
+  h_73cfd908b059c1 4-7,14,33-56,61
+scripts/doctor.mjs
+  h_73cfd908b059c1 2,7-16,18-21,23-24,27-31
+scripts/install-ssh-user.sh
+  h_73cfd908b059c1 1-38
+scripts/smoke-real-chrys.mjs
+  h_73cfd908b059c1 1-164
+src/adapter.mts
+  h_73cfd908b059c1 2,75-92,106,161,192-240,259,285-288,296
+src/chrys-acp-runtime.mts
+  h_73cfd908b059c1 1-378
+src/chrys-catalog.mts
+  h_73cfd908b059c1 1-61
+src/runtime-config.mts
+  h_73cfd908b059c1 8,43-50,88-91
+src/runtime-factory.mts
+  h_73cfd908b059c1 1,171-172
+src/server-helpers.mts
+  h_73cfd908b059c1 5,123,129-130
+src/server.mts
+  h_73cfd908b059c1 7,122,344,381-386,653,3581,3588,3609
+src/transports.mts
+  h_73cfd908b059c1 131,133,167,173
+src/util.mts
+  h_73cfd908b059c1 33-45,57,150,161,164-168
+test/adapter.test.mts
+  h_73cfd908b059c1 16-23,874,1469,1545-1547,2056,2073-2084,2086,2118,2140,4416-4422,5262
+test/runtime-config.test.mts
+  h_73cfd908b059c1 60-61
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "b0a71f5bf8448b887595afc42a311fbbd0a5361b",
+  "prompts": {},
+  "humans": {
+    "h_73cfd908b059c1": {
+      "author": "zhuyu <zhuyu4010qq@gmail.com>"
+    }
+  }
+}
