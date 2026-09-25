@@ -1,0 +1,209 @@
+.claude/settings.json
+  s_73a0b196d2ef34::t_c73e44718febc3 1-20
+.github/dependabot.yml
+  s_73a0b196d2ef34::t_7b588da600db83 1-15
+.github/workflows/ci.yml
+  s_73a0b196d2ef34::t_8ec46951695e7a 1-33
+.github/workflows/deploy-docs.yml
+  s_73a0b196d2ef34::t_bb16e5df9ca22e 1-51
+.gitignore
+  s_73a0b196d2ef34::t_0a12cba4111d78 1-14
+.npmrc
+  s_73a0b196d2ef34::t_ec2ce6c5dde268 1
+.nvmrc
+  s_73a0b196d2ef34::t_18345d3b5a26dd 1
+AGENTS.md
+  s_73a0b196d2ef34::t_b6a330eed65032 1-68
+CHANGELOG.md
+  s_73a0b196d2ef34::t_3e22ffed3d56ed 1-97
+CONTRIBUTING.md
+  s_73a0b196d2ef34::t_a2f9e59d2158fb 1-48
+Cargo.lock
+  s_73a0b196d2ef34::t_71819462df42aa 1-107
+Cargo.toml
+  s_73a0b196d2ef34::t_1777c12c0bef78 1-35
+LICENSE
+  s_73a0b196d2ef34::t_4ce88ff2295e30 1-21
+SECURITY.md
+  s_73a0b196d2ef34::t_166efed1fcdf7b 1-42
+biome.json
+  s_73a0b196d2ef34::t_ef9d3295388bca 1-35
+crates/claude-codex-protocol/Cargo.toml
+  s_73a0b196d2ef34::t_29c73e3eca3d95 1-15
+crates/claude-codex-protocol/README.md
+  s_73a0b196d2ef34::t_f523689724421f 1-24
+crates/claude-codex-protocol/fixtures/config-read.request.json
+  s_73a0b196d2ef34::t_7e384da395336f 1-6
+crates/claude-codex-protocol/fixtures/config-read.response.json
+  s_73a0b196d2ef34::t_8d1f54b73f1ef3 1-56
+crates/claude-codex-protocol/fixtures/initialize.request.json
+  s_73a0b196d2ef34::t_69d903025b3a27 1-13
+crates/claude-codex-protocol/fixtures/mcp-server-status-list.response.json
+  s_73a0b196d2ef34::t_5bb5e0e35f4eb1 1-15
+crates/claude-codex-protocol/fixtures/thread-start.request.json
+  s_73a0b196d2ef34::t_583de9e699a93c 1-10
+crates/claude-codex-protocol/fixtures/turn-completed.notification.json
+  s_73a0b196d2ef34::t_1c4338c504fe88 1-17
+crates/claude-codex-protocol/fixtures/turn-started.notification.json
+  s_73a0b196d2ef34::t_f7ff42ee94b480 1-17
+crates/claude-codex-protocol/src/lib.rs
+  s_73a0b196d2ef34::t_55a44bd26761bf 1-246
+docs/.vitepress/config.mts
+  s_73a0b196d2ef34::t_4d0644f1d9f061 1-70
+docs/contributing.md
+  s_73a0b196d2ef34::t_3ad72fa7c93a8d 1-72
+docs/guide/backends.md
+  s_73a0b196d2ef34::t_54f8782c9de50a 1-82
+docs/guide/configuration.md
+  s_73a0b196d2ef34::t_c9ad62bdb85481 1-127
+docs/guide/deployment.md
+  s_73a0b196d2ef34::t_85df8bb1267477 1-85
+docs/guide/getting-started.md
+  s_73a0b196d2ef34::t_8f60b15f2d25f6 1-66
+docs/guide/gui.md
+  s_73a0b196d2ef34::t_2e6568f33ab81f 1-52
+docs/index.md
+  s_73a0b196d2ef34::t_a67d61c547c115 1-76
+docs/reference/capability-matrix.md
+  s_73a0b196d2ef34::t_78213639fba096 1-136
+docs/reference/protocol-coverage.md
+  s_73a0b196d2ef34::t_fecd0ed028826b 1-30
+docs/reference/release-readiness.md
+  s_73a0b196d2ef34::t_45bafb26371ea3 1-146
+docs/reference/validation.md
+  s_73a0b196d2ef34::t_ad1bd75976b08d 1-34
+docs/reference/workflow-operations.md
+  s_73a0b196d2ef34::t_57d02fb5246705 1-132
+docs/rfcs/provider-and-agent-loop-boundaries.md
+  s_73a0b196d2ef34::t_e49e0142453ee9 1-311
+docs/rfcs/rust-first-runtime.md
+  s_73a0b196d2ef34::t_3fb8dd970324b0 1-229
+examples/README.md
+  s_73a0b196d2ef34::t_8ef3737d6cd5d9 1-50
+package-lock.json
+  s_73a0b196d2ef34::t_d03b2e49be5cfc 1-4866
+scripts/AGENTS.md
+  s_73a0b196d2ef34::t_7bebe57f178fd4 1-33
+scripts/acceptance-gui-ssh-localhost.mjs
+  s_73a0b196d2ef34::t_4f4f3349b94aca 1-457
+scripts/acceptance-local-remote.mjs
+  s_73a0b196d2ef34::t_08a96c6d35c3ed 1-309
+scripts/acceptance-ssh-runtime-matrix.mjs
+  s_73a0b196d2ef34::t_914b5337cb01fe 1-470
+scripts/check-rust-protocol-fixtures.mjs
+  s_73a0b196d2ef34::t_4cdf9ae22731ab 1-271
+scripts/claude-codex-mode
+  s_73a0b196d2ef34::t_04b20bc2ceead8 1-1017
+scripts/doctor.mjs
+  s_73a0b196d2ef34::t_933139f46f19b9 1-31
+scripts/hooks/guard.mjs
+  s_73a0b196d2ef34::t_eda684383b368c 1-120
+scripts/probe-capabilities.mjs
+  s_73a0b196d2ef34::t_0364873d4a92c0 1-151
+scripts/probe-codex-cli-remote.mjs
+  s_73a0b196d2ef34::t_548d1165a131ce 1-165
+scripts/pty-bridge.py
+  s_73a0b196d2ef34::t_95764b32a3f5e3 1-95
+scripts/smoke-real-claude.mjs
+  s_73a0b196d2ef34::t_0b1cd841d80a20 1-93
+src/AGENTS.md
+  s_73a0b196d2ef34::t_b5ec71facf8214 1-43
+src/chrys-catalog.mts
+  s_73a0b196d2ef34::t_c1616cae2ba441 1-61
+src/claude-capabilities.mts
+  s_73a0b196d2ef34::t_c3d8aeaadb4fc6 1-200
+src/claude-p-runtime.mts
+  s_73a0b196d2ef34::t_86026114f207ad 1-331
+src/codex-proxy-runtime.mts
+  s_73a0b196d2ef34::t_d1d6d74bf15d6a 1-367
+src/github-queue.mts
+  s_73a0b196d2ef34::t_f683810affb229 1-100
+src/http-agent-runtime.mts
+  s_73a0b196d2ef34::t_b8047cb13e6390 1-538
+src/mcp.mts
+  s_73a0b196d2ef34::t_6a25345f410e45 1-326
+src/mock-runtime.mts
+  s_73a0b196d2ef34::t_6f7ab64fdee7c4 1-410
+src/native-runtime.mts
+  s_73a0b196d2ef34::t_f6c79ec871f054 1-1524
+src/provider-loop-config.mts
+  s_73a0b196d2ef34::t_6f82eb4283c09e 1-147
+src/provider-loop-descriptor-schema.mts
+  s_73a0b196d2ef34::t_abf6c8c64839de 1-252
+src/provider-loop-descriptor-types.mts
+  s_73a0b196d2ef34::t_323563a8eaeb12 1-82
+src/provider-loop-descriptors.mts
+  s_73a0b196d2ef34::t_fc277cffc48e0f 1-72
+src/provider-loop-selection.mts
+  s_73a0b196d2ef34::t_213a1df913dbd8 1-175
+src/run-registry.mts
+  s_73a0b196d2ef34::t_5bc3b5cd64ad01 1-81
+src/runtime-factory.mts
+  s_73a0b196d2ef34::t_25cb2cd9169026 1-186
+src/server-helpers.mts
+  s_73a0b196d2ef34::t_92e63c276ae5c3 1-1107
+src/store.mts
+  s_73a0b196d2ef34::t_8fc423e17b8c04 1-960
+src/types.mts
+  s_73a0b196d2ef34::t_97cc7cd4364c20 1-448
+src/workflow-cli.mts
+  s_73a0b196d2ef34::t_571e6d139ebf78 1-256
+src/workflow-command.mts
+  s_73a0b196d2ef34::t_c384553da62584 1-22
+src/workflow-health.mts
+  s_73a0b196d2ef34::t_5e3e1eda68e8f9 1-65
+src/workflow-scheduler.mts
+  s_73a0b196d2ef34::t_fb6caf5e5f7fc5 1-192
+src/workflow-state.mts
+  s_73a0b196d2ef34::t_495ef979e5cf0e 1-250
+src/workflow-subagents.mts
+  s_73a0b196d2ef34::t_0f87874a50cf1a 1-521
+src/worktree.mts
+  s_73a0b196d2ef34::t_bcc2d52de3e0e6 1-63
+test/AGENTS.md
+  s_73a0b196d2ef34::t_b2cca5f6de9b83 1-27
+test/desktop-presentation-prompt.test.mts
+  s_73a0b196d2ef34::t_ee28fff446cc97 1-137
+test/fixtures/mcp-stdio-server.mjs
+  s_73a0b196d2ef34::t_eb78f1c79b43ae 1-59
+test/github-queue.test.mts
+  s_73a0b196d2ef34::t_0a14882f59302c 1-52
+test/native-runtime-presentation.test.mts
+  s_73a0b196d2ef34::t_ae66dad77ea6fe 1-215
+test/presentation.test.mts
+  s_73a0b196d2ef34::t_732922527be74c 1-375
+test/provider-loop-config.test.mts
+  s_73a0b196d2ef34::t_d6e48e3c7952c8 1-153
+test/provider-loop-descriptors.test.mts
+  s_73a0b196d2ef34::t_d08879afefbcf2 1-87
+test/provider-loop-selection.test.mts
+  s_73a0b196d2ef34::t_cd1941c76fc6c8 1-90
+test/run-registry.test.mts
+  s_73a0b196d2ef34::t_25d765b18f84b6 1-66
+test/util.test.mts
+  s_73a0b196d2ef34::t_f5d7bef61d4bc9 1-21
+test/workflow-cli.test.mts
+  s_73a0b196d2ef34::t_7038d68e77402b 1-242
+test/workflow-scheduler.test.mts
+  s_73a0b196d2ef34::t_38782d063c7edb 1-230
+test/worktree.test.mts
+  s_73a0b196d2ef34::t_34bb5c245516cd 1-82
+tsconfig.json
+  s_73a0b196d2ef34::t_045fc29a2ca3e1 1-28
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.4",
+  "base_commit_sha": "c0d2456230d9f6b83a2ba4f85e15e5ca32147382",
+  "prompts": {},
+  "sessions": {
+    "s_73a0b196d2ef34": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "01a0c776-2e22-7192-8ad0-6124d8733a78",
+        "model": "gpt-5.6-sol"
+      },
+      "human_author": "zhuyu <zhuyu4010qq@gmail.com>"
+    }
+  }
+}
