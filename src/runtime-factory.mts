@@ -1,3 +1,4 @@
+import { ChrysAcpRuntime } from './chrys-acp-runtime.mjs'
 import { ClaudePTranscriptRuntime } from './claude-p-runtime.mjs'
 import { CodexProxyRuntime } from './codex-proxy-runtime.mjs'
 import { HttpAgentRuntime } from './http-agent-runtime.mjs'
@@ -167,6 +168,8 @@ function conciseStructuredString(prompt: string): string {
 
 function instantiateRuntime(config: RuntimeConfig, type: RuntimeBackendType): ClaudeRuntime {
   switch (type) {
+    case 'chrys-acp':
+      return new ChrysAcpRuntime()
     case 'mock':
       return new MockRuntime()
     case 'agent-http':

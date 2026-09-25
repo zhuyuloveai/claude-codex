@@ -57,8 +57,8 @@ function nativeTurnContext(overrides: Partial<RuntimeTurnContext> = {}): Runtime
   }
 }
 
-test('runtime config keeps legacy defaults and accepts explicit backends', () => {
-  assert.equal(resolveRuntimeConfig({}).type, 'agent-sdk-sidecar')
+test('runtime config defaults to Chrys ACP and accepts explicit legacy backends', () => {
+  assert.equal(resolveRuntimeConfig({}).type, 'chrys-acp')
   assert.equal(resolveRuntimeConfig({ CLAUDE_CODEX_MOCK: '1' }).type, 'mock')
   assert.equal(
     resolveRuntimeConfig({ CLAUDE_CODEX_RUNTIME_SOCKET: '/tmp/runtime.sock' }).type,

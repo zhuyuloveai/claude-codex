@@ -1,0 +1,5 @@
+This project derives its Codex app-server compatibility layer from
+fuergaosi233/claude-codex, released under the MIT License.
+
+The Chrys ACP runtime, catalog integration, deployment shim, installer, and
+acceptance coverage were added for this project.

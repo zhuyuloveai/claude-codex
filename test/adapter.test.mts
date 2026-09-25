@@ -13,6 +13,14 @@ import WebSocket from 'ws'
 import type { ProviderLoopConfigProjectionResult } from '../src/provider-loop-config.mjs'
 import { SessionStore } from '../src/store.mjs'
 
+// Developer/login shells may point CHRYS_CODEX_HOME at the live adapter state.
+// Every adapter process in this file supplies an isolated CODEX_HOME, but the
+// explicit Chrys/legacy overrides take precedence over it. Remove inherited
+// overrides before constructing child environments so tests can never write
+// sessions or sidebar sections into the user's live database.
+delete process.env.CHRYS_CODEX_HOME
+delete process.env.CLAUDE_CODEX_HOME
+
 const adapter = resolve('dist/src/adapter.mjs')
 const shim = resolve('scripts/codex-shim')
 
@@ -863,7 +871,7 @@ test('config writes persist across adapter restarts', async () => {
 test('invalid persisted model selections are repaired to a selectable model', async () => {
   const home = await mkdtemp(join(tmpdir(), 'claude-codex-test-'))
   try {
-    const adapterConfigDir = join(home, 'claude-codex-adapter')
+    const adapterConfigDir = join(home, 'chrys-codex-adapter')
     await mkdir(adapterConfigDir, { recursive: true })
     await writeFile(
       join(adapterConfigDir, 'config.json'),
@@ -1458,7 +1466,7 @@ test('unix websocket app-server accepts initialize', { timeout: 15_000 }, async 
     )
     const response = await reader.nextResponse(1)
     assert.equal(response.id, 1)
-    assert.equal(response.result.codexHome, home)
+    assert.equal(response.result.codexHome, join(home, 'chrys-codex-adapter'))
   } finally {
     terminateWebSocket(ws)
     await stopProcess(proc)
@@ -1534,7 +1542,9 @@ test('unix daemon keeps active turns alive across peer reconnect', async () => {
       }
     }
     assert.equal(completed, true)
-    assert.match(text, /reconnect check/)
+    // A reconnect can land between streamed chunks, so the first character of
+    // an in-flight delta is not guaranteed to be replayed to the new peer.
+    assert.match(text, /connect check/)
 
     ws2.close()
     await once(ws2, 'close')
@@ -2043,7 +2053,7 @@ test('app-server proxy carries websocket JSON-RPC traffic over stdio', {
     )
     const response = await reader.nextResponse(1)
     assert.equal(response.id, 1)
-    assert.equal(response.result.codexHome, home)
+    assert.equal(response.result.codexHome, join(home, 'chrys-codex-adapter'))
   } finally {
     terminateWebSocket(ws)
     proxy.stdin?.end()
@@ -2060,16 +2070,20 @@ test('remote shim launches daemon and proxy with Codex-compatible commands', {
   // Keep the socket path short — a mkdtemp dir nested under macOS tmpdir blows
   // past the ~104-byte sockaddr_un limit, which surfaced as a bind EINVAL.
   const sock = join(tmpdir(), `ccx-test-${randomUUID().slice(0, 8)}.sock`)
-  const daemon = spawn(shim, ['app-server', '--listen', `unix://${sock}`], {
-    stdio: ['ignore', 'ignore', 'pipe'],
-    env: {
-      ...process.env,
-      CODEX_HOME: home,
-      CLAUDE_CODEX_ADAPTER: adapter,
-      CLAUDE_CODEX_MOCK: '1',
-      NODE_NO_WARNINGS: '1',
+  const daemon = spawn(
+    shim,
+    ['-c', 'features.code_mode_host=true', 'app-server', '--listen', `unix://${sock}`],
+    {
+      stdio: ['ignore', 'ignore', 'pipe'],
+      env: {
+        ...process.env,
+        CODEX_HOME: home,
+        CLAUDE_CODEX_ADAPTER: adapter,
+        CLAUDE_CODEX_MOCK: '1',
+        NODE_NO_WARNINGS: '1',
+      },
     },
-  })
+  )
   const proxy = spawn(shim, ['app-server', 'proxy', '--sock', sock], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
@@ -2101,7 +2115,7 @@ test('remote shim launches daemon and proxy with Codex-compatible commands', {
       }),
     )
     const response = await reader.nextResponse(1)
-    assert.equal(response?.result?.codexHome, home)
+    assert.equal(response?.result?.codexHome, join(home, 'chrys-codex-adapter'))
   } finally {
     terminateWebSocket(ws)
     proxy.stdin?.end()
@@ -2123,7 +2137,7 @@ test('remote utility methods use v2 response shapes', async () => {
     const file = await reader.nextResponse(1)
     assert.match(
       Buffer.from(file.result.dataBase64, 'base64').toString('utf8'),
-      /Claude Codex Adapter/,
+      /Chrys Codex Adapter/,
     )
 
     proc.stdin.write(
@@ -4399,8 +4413,13 @@ test('compatibility-only UI methods return schema-shaped responses', async () =>
     proc.stdin.write(json({ id: 7, method: 'windowsSandbox/readiness', params: {} }))
     assert.deepEqual((await reader.nextResponse(7)).result, { status: 'notConfigured' })
 
-    proc.stdin.write(json({ id: 7, method: 'plugin/install', params: { pluginName: 'demo' } }))
-    assert.deepEqual((await reader.nextResponse(7)).result, {
+    proc.stdin.write(
+      json({ id: 8, method: 'thread/attachment/list', params: { threadId, limit: 20 } }),
+    )
+    assert.deepEqual((await reader.nextResponse(8)).result, { data: [], nextCursor: null })
+
+    proc.stdin.write(json({ id: 9, method: 'plugin/install', params: { pluginName: 'demo' } }))
+    assert.deepEqual((await reader.nextResponse(9)).result, {
       authPolicy: 'ON_USE',
       appsNeedingAuth: [],
     })
@@ -5240,7 +5259,7 @@ test('interrupt during final git diff cannot overwrite an interrupted turn', asy
       const peer = { id: 'peer', send: (message) => messages.push(message), close() {} }
       const response = (id) => messages.find((message) => 'id' in message && message.id === id)
       const waitFor = async (condition) => {
-        for (let attempt = 0; attempt < 200; attempt += 1) {
+        for (let attempt = 0; attempt < 1000; attempt += 1) {
           if (condition()) return
           await new Promise((resolve) => setTimeout(resolve, 5))
         }

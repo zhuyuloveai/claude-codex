@@ -30,7 +30,19 @@ export function codexHome(): string {
 }
 
 export function adapterHome(): string {
-  return resolve(process.env.CLAUDE_CODEX_HOME || join(codexHome(), 'claude-codex-adapter'))
+  const configured = process.env.CHRYS_CODEX_HOME || process.env.CLAUDE_CODEX_HOME
+  if (configured) return resolve(configured)
+  if (process.env.CODEX_HOME) return resolve(join(codexHome(), 'chrys-codex-adapter'))
+  return resolve(join(homedir(), '.chrys-codex'))
+}
+
+// `initialize.codexHome` is also a host/session identity hint to Codex App.
+// Reporting the real ~/.codex path from a localhost SSH adapter makes the App
+// merge official local Codex sessions into the Chrys host. Keep this namespace
+// distinct even though the SSH bootstrap itself still uses CODEX_HOME for its
+// control socket and forwarded agent.
+export function reportedCodexHome(): string {
+  return resolve(process.env.CHRYS_CODEX_REPORTED_HOME || adapterHome())
 }
 
 // Unix domain socket paths are bounded by sockaddr_un.sun_path — roughly 104
@@ -42,7 +54,7 @@ export function socketPathLimit(): number {
 }
 
 export function defaultSocketPath(): string {
-  const preferred = join(codexHome(), 'app-server-control', 'app-server-control.sock')
+  const preferred = join(adapterHome(), 'app-server-control.sock')
   if (preferred.length <= socketPathLimit()) return preferred
   return join(tmpdir(), `ccx-${stableHash(preferred).slice(0, 16)}.sock`)
 }
@@ -135,6 +147,7 @@ const DEFAULT_CODEX_COMPAT_VERSION = '0.142.3'
 
 export function codexCompatVersion(): string {
   return (
+    process.env.CHRYS_CODEX_COMPAT_VERSION ||
     process.env.CLAUDE_CODEX_COMPAT_VERSION ||
     process.env.CODEX_SHIM_COMPAT_VERSION ||
     DEFAULT_CODEX_COMPAT_VERSION
@@ -145,10 +158,14 @@ export function codexCompatVersion(): string {
 // Claude adapter is identifiable next to a real `codex` that now reports the
 // same version. Set CLAUDE_CODEX_VERSION_SUFFIX="" to disable and behave exactly
 // like upstream codex.
-const DEFAULT_VERSION_SUFFIX = 'claude-codex'
+const DEFAULT_VERSION_SUFFIX = 'chrys-codex'
 
 export function codexVersionSuffix(): string {
-  return process.env.CLAUDE_CODEX_VERSION_SUFFIX ?? DEFAULT_VERSION_SUFFIX
+  return (
+    process.env.CHRYS_CODEX_VERSION_SUFFIX ??
+    process.env.CLAUDE_CODEX_VERSION_SUFFIX ??
+    DEFAULT_VERSION_SUFFIX
+  )
 }
 
 export function codexCliVersion(): string {

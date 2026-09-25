@@ -2,6 +2,7 @@ import { type ChildProcess, execFile, spawn } from 'node:child_process'
 import { type FSWatcher, readFileSync, watch, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
+import { chrysModelOptions, useChrysRuntime } from './chrys-catalog.mjs'
 import { callMcpTool, readMcpConfig, readMcpResource } from './mcp.mjs'
 import type { SessionStore } from './store.mjs'
 import type {
@@ -119,12 +120,14 @@ export function allSelectableModelOptions(): Array<{
   description: string
   isDefault?: boolean
 }> {
+  if (useChrysRuntime()) return chrysModelOptions()
   return [...claudeModelOptions(), ...codexProxyModelOptions()]
 }
 
 export function defaultSelectableModelId(): string {
   const options = allSelectableModelOptions()
-  const defaultModel = process.env.CLAUDE_CODEX_DEFAULT_MODEL
+  const defaultModel =
+    process.env.CHRYS_CODEX_DEFAULT_MODEL ?? process.env.CLAUDE_CODEX_DEFAULT_MODEL
   if (defaultModel && options.some((option) => option.id === defaultModel)) return defaultModel
   return options.find((option) => option.isDefault === true)?.id ?? options[0]?.id ?? 'sonnet'
 }

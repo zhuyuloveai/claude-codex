@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { spawn } from 'node:child_process'
 import { chmodSync, existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { createRuntime } from './runtime-factory.mjs'
@@ -71,6 +72,24 @@ async function main(): Promise<void> {
   const listen = getArg(args, '--listen') ?? 'stdio://'
   if (listen === 'off') return
   const isUnixDaemon = listen.startsWith('unix://')
+  // The SSH bootstrap used by Codex App backgrounds an AND-list whose final
+  // command is `codex app-server --listen unix://`. That shell still waits for
+  // a foreground app-server, so the shim asks this short-lived launcher to
+  // detach a child and return only after the socket is listening.
+  if (
+    isUnixDaemon &&
+    process.env.CHRYS_CODEX_DAEMONIZE === '1' &&
+    process.env.CHRYS_CODEX_DAEMON_CHILD !== '1'
+  ) {
+    await spawnDetachedUnixDaemon()
+    return
+  }
+  // Codex Remote bootstraps this daemon through `ssh ... nohup codex ... &`.
+  // A background process that keeps the SSH channel's stdin open prevents
+  // ssh from returning even after stdout/stderr have been redirected, so the
+  // App waits for its full bootstrap timeout before trying the proxy. The
+  // unix daemon never reads stdin; close it as soon as the transport is known.
+  if (isUnixDaemon) process.stdin.destroy()
   let pidFile: string | null = null
   if (isUnixDaemon) {
     pidFile = ensureSingleUnixDaemon(listen)
@@ -84,9 +103,7 @@ async function main(): Promise<void> {
   // "loading" forever after a restart.
   const recovered = store.recoverStaleInProgressTurns()
   if (recovered > 0) {
-    process.stderr.write(
-      `[claude-codex-adapter] recovered ${recovered} stale in-progress turn(s)\n`,
-    )
+    process.stderr.write(`[chrys-codex-adapter] recovered ${recovered} stale in-progress turn(s)\n`)
   }
   const runtime = createRuntime()
   const server = new CodexClaudeAppServer(store, runtime)
@@ -141,7 +158,7 @@ async function main(): Promise<void> {
     idleTimer = setTimeout(() => {
       debugLog('adapter.idleExit', { idleExitMs, pid: process.pid })
       process.stderr.write(
-        `[claude-codex-adapter] no active peers for ${idleExitMs}ms, shutting down\n`,
+        `[chrys-codex-adapter] no active peers for ${idleExitMs}ms, shutting down\n`,
       )
       void shutdown('idleExit')
     }, idleExitMs)
@@ -172,6 +189,55 @@ async function main(): Promise<void> {
     return
   }
   await startWebSocketTransport(normalized, onMessage, onClose, onConnect)
+  if (isUnixDaemon && typeof process.send === 'function') {
+    process.send({ type: 'chrys-codex-ready' })
+  }
+}
+
+async function spawnDetachedUnixDaemon(): Promise<void> {
+  const child = spawn(process.execPath, process.argv.slice(1), {
+    detached: true,
+    stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
+    env: { ...process.env, CHRYS_CODEX_DAEMON_CHILD: '1' },
+  })
+  await new Promise<void>((resolve, reject) => {
+    let settled = false
+    const finish = (error?: Error) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      child.off('error', onError)
+      child.off('exit', onExit)
+      child.off('message', onMessage)
+      if (error) reject(error)
+      else resolve()
+    }
+    const onError = (error: Error) => finish(error)
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      // ensureSingleUnixDaemon exits 0 when a healthy daemon already owns the
+      // socket, which is also a successful bootstrap outcome.
+      if (code === 0) finish()
+      else finish(new Error(`detached app-server exited before ready (code=${code}, signal=${signal})`))
+    }
+    const onMessage = (message: unknown) => {
+      if (
+        message &&
+        typeof message === 'object' &&
+        (message as { type?: unknown }).type === 'chrys-codex-ready'
+      ) {
+        finish()
+      }
+    }
+    const timer = setTimeout(() => {
+      child.kill('SIGTERM')
+      finish(new Error('timed out waiting for detached app-server socket'))
+    }, 10_000)
+    child.once('error', onError)
+    child.once('exit', onExit)
+    child.on('message', onMessage)
+  })
+  if (child.connected) child.disconnect()
+  child.unref()
 }
 
 function getArg(args: string[], name: string): string | null {
@@ -190,7 +256,7 @@ function ensureSingleUnixDaemon(listen: string): string {
     const pid = Number(readFileSync(pidFile, 'utf8'))
     if (Number.isFinite(pid) && processIsAlive(pid)) {
       process.stderr.write(
-        `[claude-codex-adapter] app-server already running at ${socketPath} (pid ${pid})\n`,
+        `[chrys-codex-adapter] app-server already running at ${socketPath} (pid ${pid})\n`,
       )
       process.exit(0)
     }
@@ -216,10 +282,10 @@ function processIsAlive(pid: number): boolean {
 
 function usage(code: number): never {
   const text = `Usage:
-  claude-codex-adapter app-server --listen stdio://
-  claude-codex-adapter app-server --listen unix://
-  claude-codex-adapter app-server --listen ws://127.0.0.1:8788
-  claude-codex-adapter app-server proxy [--sock PATH]
+  chrys-codex-adapter app-server --listen stdio://
+  chrys-codex-adapter app-server --listen unix://
+  chrys-codex-adapter app-server --listen ws://127.0.0.1:8788
+  chrys-codex-adapter app-server proxy [--sock PATH]
 `
   ;(code === 0 ? process.stdout : process.stderr).write(text)
   process.exit(code)
@@ -227,7 +293,7 @@ function usage(code: number): never {
 
 main().catch((error) => {
   process.stderr.write(
-    `[claude-codex-adapter] ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`,
+    `[chrys-codex-adapter] ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`,
   )
   process.exit(1)
 })

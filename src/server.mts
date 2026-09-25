@@ -4,6 +4,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
+import { chrysModelOptions, useChrysRuntime } from './chrys-catalog.mjs'
 import { listClaudeHooks, listClaudeSkills } from './claude-capabilities.mjs'
 import { callMcpTool, listMcpServerStatuses, readMcpConfig, readMcpResource } from './mcp.mjs'
 import { projectProviderLoopConfig } from './provider-loop-config.mjs'
@@ -118,6 +119,7 @@ import {
   nowSeconds,
   platformFamily,
   platformOs,
+  reportedCodexHome,
   resolveClaudeEffort,
   resolveClaudeModel,
   textFromInput,
@@ -339,7 +341,7 @@ export class CodexClaudeAppServer {
             stringOr(clientInfo.name, 'codex-app'),
             stringOr(clientInfo.version, 'unknown'),
           ),
-          codexHome: codexHome(),
+          codexHome: reportedCodexHome(),
           platformFamily: platformFamily(),
           platformOs: platformOs(),
         }
@@ -376,6 +378,12 @@ export class CodexClaudeAppServer {
         return this.threadGoalClear(asRecord(params))
       case 'thread/metadata/update':
         return this.threadMetadataUpdate(asRecord(params))
+      case 'thread/attachment/list':
+        // Chrys sessions currently store user image/file input as turn items,
+        // not as Codex's separate thread attachment records. Newer Codex App
+        // builds poll this endpoint for every visible thread, so return the
+        // schema-correct empty page instead of spamming RPC errors.
+        return { data: [], nextCursor: null }
       case 'thread/section/move':
         return this.threadSectionMove(asRecord(params))
       case 'threadSection/list':
@@ -642,7 +650,7 @@ export class CodexClaudeAppServer {
       cwd,
       model,
       reasoningEffort,
-      modelProvider: 'claude-code',
+      modelProvider: useChrysRuntime() ? 'chrys' : 'claude-code',
       claudeSessionId: null,
       // v2 SessionSource is camelCase; the old `app_server` falls through to
       // `unknown` on the App side, hiding the source in the thread sidebar.
@@ -3570,14 +3578,14 @@ export class CodexClaudeAppServer {
 
   private modelList(): unknown {
     const defaultModel = this.configModel
-    const claudeOptions = claudeModelOptions()
+    const claudeOptions = useChrysRuntime() ? chrysModelOptions() : claudeModelOptions()
     // When a real Codex CLI binary is available on the host (CODEX_REAL env
     // or auto-discovered), expose its native models alongside Claude's so
     // the Codex App's per-thread model picker can route between backends
     // without any reconnect or shell flip. Picking gpt-* flips the thread
     // to runtimeBackend='codex' which the runtime router dispatches to
     // CodexProxyRuntime (shells out to `codex exec --json`).
-    const codexOptions = codexProxyModelOptions()
+    const codexOptions = useChrysRuntime() ? [] : codexProxyModelOptions()
     const options = [...claudeOptions, ...codexOptions]
     const hasConfiguredDefault = options.some((option) => option.id === defaultModel)
     const reasoningEfforts = [
@@ -3598,7 +3606,7 @@ export class CodexClaudeAppServer {
         hidden: false,
         supportedReasoningEfforts: reasoningEfforts,
         defaultReasoningEffort: this.configReasoningEffort,
-        inputModalities: ['text', 'image'],
+        inputModalities: 'inputModalities' in option ? option.inputModalities : ['text', 'image'],
         supportsPersonality: false,
         additionalSpeedTiers: [],
         isDefault: hasConfiguredDefault ? option.id === defaultModel : option.isDefault === true,

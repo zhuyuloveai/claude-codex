@@ -1,210 +1,135 @@
-# Claude Codex Adapter
+# Chrys Codex Adapter
 
-[![CI](https://github.com/fuergaosi233/claude-codex/actions/workflows/ci.yml/badge.svg)](https://github.com/fuergaosi233/claude-codex/actions/workflows/ci.yml)
-[![Docs](https://github.com/fuergaosi233/claude-codex/actions/workflows/deploy-docs.yml/badge.svg)](https://fuergaosi233.github.io/claude-codex/)
-[![Node](https://img.shields.io/badge/node-%3E%3D24-brightgreen)](https://nodejs.org)
+把 Chrys ACP 二进制包装成 Codex `app-server`，供 Codex 桌面应用通过 Remote SSH 使用。
+Codex App 本身无需修改，原生 `Control this Mac` 仍使用官方 Codex CLI。
 
-Production TypeScript adapter that lets the **Codex desktop app** talk to
-**Claude Code** through the native Codex `app-server` protocol in Remote mode.
+```text
+Codex App
+├── Control this Mac ──▶ 官方 Codex CLI
+└── Chrys Local (SSH) ──▶ codex shim ──▶ Chrys Codex Adapter ──▶ chrys acp
+```
 
-Codex App still runs its normal SSH version probe, bootstrap, and `app-server
-proxy` flow — but `codex app-server` is handled by this adapter instead of the
-real Codex runtime, so agent turns run on Claude Code.
+## 已实现能力
 
-📖 **Documentation: <https://fuergaosi233.github.io/claude-codex/>**
+- Codex `initialize`、模型目录以及配置协议
+- 任务创建、列表、读取、恢复、归档和持久化
+- Chrys ACP `session/new`、`session/load`、`session/prompt` 和 `session/cancel`
+- 文本、推理、工具调用和用量的实时事件
+- 命令与文件修改审批
+- Chrys `_chrys/request_input` 到 Codex 原生问题卡片
+- 文件修改和 `turn/diff/updated`
+- stdio、WebSocket、Unix socket 和 `app-server proxy`
 
-## Quick start
+## 要求
+
+- macOS 或 Linux
+- Node.js 24+
+- 已安装并可运行的 Chrys 二进制
+- Codex 桌面应用
+- 一个用于 Chrys 的 SSH 用户。推荐独立用户，避免其 `codex` shim 影响原生 CLI。
+
+## 构建与真实验证
 
 ```bash
 npm install
-npm run build        # tsc -> dist/ (production artifact)
-npm run dev          # tsx src/adapter.mts — run sources directly, no build
-npm run doctor       # environment self-check
+npm run build
+npm run smoke:chrys
 ```
 
-> **Requires Node.js 24+** for stable `node:sqlite`. Set `CLAUDE_CODEX_NODE` to
-> pin a node binary if your default is older.
+`smoke:chrys` 会调用真实 Chrys，验证模型目录、两轮会话恢复、审批、文件创建和 diff。
 
-Then install the `codex` shim on the remote host and add a Remote connection in
-the Codex App:
+## 安装到 Chrys SSH 用户
+
+如果还没有专用用户，在 macOS **系统设置 → 用户与群组**中新建标准用户 `chrys-agent`，再到
+**系统设置 → 通用 → 共享 → 远程登录**允许该用户登录。为 Codex App 创建独立密钥：
 
 ```bash
-mkdir -p ~/bin
-cp scripts/codex-shim ~/bin/codex && chmod +x ~/bin/codex
-export PATH="$HOME/bin:$PATH"
-export CLAUDE_CODEX_ADAPTER="$PWD/dist/src/adapter.mjs"
-export ANTHROPIC_API_KEY="<your-anthropic-api-key>" # or authenticate with `claude /login`
+ssh-keygen -t ed25519 -f "$HOME/.ssh/chrys_codex" -C chrys-codex
+ssh-copy-id -i "$HOME/.ssh/chrys_codex.pub" chrys-agent@127.0.0.1
+ssh -i "$HOME/.ssh/chrys_codex" chrys-agent@127.0.0.1 'echo ssh-ok'
 ```
 
-Provide credentials only through your local shell or secret manager. Do not
-commit API keys, OAuth/session data, `.env` files, or acceptance-test logs.
-
-Full walkthrough → **[Getting started](https://fuergaosi233.github.io/claude-codex/guide/getting-started)**.
-
-## How it works
-
-```
-Codex App ──SSH──▶ login shell ──▶ codex (shim, earlier in PATH)
-                                     │
-                  app-server calls ──┘──▶ Claude Codex Adapter ──▶ Claude Code
-                  everything else  ──────▶ real Codex CLI (CODEX_REAL)
-```
-
-Agent text and reasoning stream into the conversation; `Bash` becomes command
-approvals; `Edit`/`Write`/`MultiEdit` become file-change approvals with live
-diffs. Runtime selection maps only to existing backend paths today: default
-in-process Claude Agent SDK, `agent-http`, `agentapi`, `claude-p`, `codex-proxy`,
-and `mock`.
-
-### Desktop conversation and visual explanations
-
-The native Claude Agent SDK backend receives presentation guidance modeled on
-Claude Desktop's conversational style: natural explanations, enough detail for
-complex questions, and formatting chosen for the content instead of a fixed
-engineering report. Questions invite discussion; requests for action still use
-and verify tools. Progress updates explain meaningful transitions while native
-tool events retain execution details.
-
-The guidance describes Codex desktop's Markdown and Mermaid rendering. For
-explanations that benefit from a diagram, Claude is encouraged to use a fenced
-`mermaid` flowchart or sequence diagram, while keeping simple answers brief and
-respecting requested language and formats. This supplements the Claude Code
-preset and preserves explicit project/developer/personality preferences. No global
-`~/.claude/CLAUDE.md` changes are needed; schema-constrained turns do not receive
-this presentation guidance.
-
-Rendering is provided by the Codex app version you use. The adapter preserves the
-Markdown in streaming and history; it does not bundle a diagram renderer or a
-Claude Desktop Artifacts runtime. Arbitrary HTML/React code fences do not become
-interactive apps. Older clients may show Mermaid source instead of a diagram.
-
-### `/workflows` compatibility
-
-With the native Claude Agent SDK backend, `/workflows <task>` is translated to Claude's
-`ultracode:` workflow trigger. Workflow task events are exposed as Codex-native reviewable
-Subagent threads. While a local workflow runs, the adapter tails its journal and projects each
-inner agent through Codex's native `subAgentActivity` lifecycle (with `completed` sent only to
-clients that advertise it) plus `spawnAgent`/`wait` tool state; runtimes without journal metadata
-fall back to one aggregate workflow agent when the workflow reaches a terminal state.
-A bare `/workflows` lists workflow runs
-recorded in the current Codex thread.
-
-This compatibility layer is specific to the native Claude Agent SDK backend. Alternate HTTP,
-agentapi, and `claude -p` backends receive no workflow event bridge. Interactive workflow
-management actions such as pause, resume, stop, and save are not implemented.
-
-When Codex Full Access is selected, the adapter keeps Claude in its standard permission mode and
-auto-allows permission requests through the existing Codex bridge. This avoids Relay's refusal of
-dangerous permission bypass outside a recognized container sandbox while preserving a zero-prompt
-Full Access turn. Operators can still opt into native SDK bypass explicitly with
-`CLAUDE_CODEX_PERMISSION_MODE=bypassPermissions` in an appropriately isolated environment.
-
-## Current release boundaries
-
-- **Production path:** the TypeScript app-server adapter remains the shipping
-  path for Codex desktop Remote mode and Claude Code.
-- **Rust-first work:** RFCs, a workspace scaffold, protocol fixtures, parse /
-  reserialize tests, and pinned fixture drift checks are present. Rust does not
-  replace the production runtime, transport, store, or launcher yet.
-- **Provider and agent-loop work:** descriptors, sanitized `config/read`
-  projection, and explicit provider/loop selection are implemented. Selection
-  is metadata and routing for known descriptors only; it maps to existing
-  runtime backends and does not add a new executable provider loop.
-- **Credential model:** use local user-owned API keys, official cloud-provider
-  credential chains, local CLI auth on the same host, or organization-managed
-  gateways that own billing, policy, audit, and provider compliance.
-- **Unsupported:** personal subscription pooling, browser cookie or session-token
-  reuse, credential sharing, private endpoint use, provider bypass behavior, and
-  claims of unavailable entitlements.
-- **Release checks:** CI runs `npm run check`, `npm run typecheck`, `npm test`,
-  `cargo test --workspace`, and the pinned Rust fixture drift check. Docs changes
-  should run `npm run docs:build`; credentialed smoke and acceptance checks stay
-  opt-in with user- or organization-owned credentials.
-
-See the
-**[release readiness reference](https://fuergaosi233.github.io/claude-codex/reference/release-readiness)**
-for the verification matrix and reviewer checklist.
-
-## Documentation
-
-| Topic | Link |
-| --- | --- |
-| Getting started | <https://fuergaosi233.github.io/claude-codex/guide/getting-started> |
-| Deployment (remote host) | <https://fuergaosi233.github.io/claude-codex/guide/deployment> |
-| Using the Codex App | <https://fuergaosi233.github.io/claude-codex/guide/gui> |
-| Configuration | <https://fuergaosi233.github.io/claude-codex/guide/configuration> |
-| Backends | <https://fuergaosi233.github.io/claude-codex/guide/backends> |
-| Capability matrix | <https://fuergaosi233.github.io/claude-codex/reference/capability-matrix> |
-| Workflow operations | <https://fuergaosi233.github.io/claude-codex/reference/workflow-operations> |
-| Release readiness | <https://fuergaosi233.github.io/claude-codex/reference/release-readiness> |
-| Contributing / toolchain | <https://fuergaosi233.github.io/claude-codex/contributing> |
-| Security policy | [SECURITY.md](SECURITY.md) |
-| Safe examples | [examples/](examples/) |
-
-Docs source lives in [`docs/`](docs/) and is published with VitePress. For
-contributors, the repo also ships progressive `AGENTS.md` files (root + `src/` +
-`scripts/` + `test/`).
-
-## Development
+把 Chrys 二进制和本工程放到该用户可访问的位置，并确认在该用户中执行 `chrys --version`
+成功。以下命令均在专用用户下执行：
 
 ```bash
-npm run dev          # run from TypeScript via tsx
-npm run typecheck    # tsc --noEmit
-npm run check        # biome format + lint
-npm test             # build + node --test
-npm run docs:dev     # preview this documentation site
+cd /path/to/chrys-codex-adapter
+npm install
+npm run install:ssh-user
 ```
 
-See **[Contributing](https://fuergaosi233.github.io/claude-codex/contributing)**
-for the full toolchain and conventions.
+安装位置默认为：
 
-## Workflow operations
+```text
+~/.local/share/chrys-codex-adapter/dist/src/adapter.mjs
+~/bin/codex
+~/.chrys-codex/
+```
 
-The adapter includes a small workflow control plane for long-running Codex
-maintenance loops. It is intentionally file-backed and explicit: the scheduler
-tracks tasks in `~/.codex/claude-codex-adapter/workflow-state.json`, and a task
-only runs after it has been queued and leased.
+确保 SSH 非交互登录也能找到 `~/bin/codex` 和 Chrys。macOS 默认 shell为 zsh 时，可在该用户的
+`~/.zshenv` 中设置：
 
 ```bash
-npm run workflow -- status
-npm run workflow -- health
-npm run workflow -- enqueue --id task-id --prompt "Do one concrete task"
-npm run workflow -- schedule --worker codex-heartbeat
-npm run workflow -- heartbeat --task task-id --worker codex-heartbeat
-npm run workflow -- complete --task task-id
+export PATH="$HOME/bin:$HOME/.local/bin:$PATH"
+export CHRYS_CODEX_ADAPTER="$HOME/.local/share/chrys-codex-adapter/dist/src/adapter.mjs"
+export CHRYS_CODEX_EXECUTABLE="$HOME/.local/bin/chrys"
 ```
 
-Use `health` from recurring heartbeats before doing more work. A healthy loop
-has no stale leases, no failed tasks, and either no running task or one running
-task with an active lease. If a lease is still active, continue that task or
-renew the heartbeat only when more time is needed. Do not enqueue duplicates.
-
-Run events are appended to
-`~/.codex/claude-codex-adapter/runs.jsonl` by default. The registry redacts
-prompt-like fields, model responses, and secret-like values before writing. Set
-`CLAUDE_CODEX_RUN_LOG=0` to disable it, or set `CLAUDE_CODEX_RUN_LOG=/path/log`
-to choose a different JSONL file.
-
-Optional per-thread worktree isolation is controlled with
-`CLAUDE_CODEX_WORKTREE_ROOT`. Thread ids are mapped to root-confined,
-collision-resistant labels, and an existing worktree is reused when present.
-If worktree setup fails, the adapter logs the failure and keeps the original
-cwd so the app-server session can continue.
-
-GitHub issue or PR automation must go through the trust-boundary queue. Export
-only trusted metadata to local JSON, then ingest it:
+从另一终端验证：
 
 ```bash
-gh issue list --json number,title,state,url > /tmp/github-issues.json
-npm run workflow -- ingest-github --github-json /tmp/github-issues.json
+ssh chrys-agent@127.0.0.1 'command -v codex; codex --version; command -v chrys'
 ```
 
-The ingestion step creates explicit workflow tasks from `number`, `title`,
-`state`, `url`, and item kind only. Body text, comments, reviews, and other
-external instructions are intentionally omitted from generated prompts, so a
-later agent must inspect external text through the project trust-boundary
-workflow before changing code.
+期望 `codex --version` 类似：
 
-## License
+```text
+codex-cli 0.142.3 (chrys-codex)
+```
 
-[MIT](LICENSE)
+## Codex App 配置
+
+打开 **Settings → Connections → SSH → Add**：
+
+```text
+Display name: Chrys Local
+Hostname: chrys-agent@127.0.0.1
+SSH port: 22
+Identity: Chrys 专用 SSH 密钥
+```
+
+保存后，在创建任务时选择 `Chrys Local`。原生任务继续选择 `Control this Mac`。
+
+这个连接窗口只配置 SSH 主机和身份，不提供 Agent 或可执行文件路径。Codex App 登录后会直接执行
+`codex --version` 和 `codex app-server ...`，因此适配器通过专用用户的 `PATH` 让 `~/bin/codex`
+被优先找到；这也是使用独立 SSH 用户的原因。
+
+## Shim 行为
+
+专用用户的 `~/bin/codex` 只接管 Codex App 需要的入口：
+
+- `codex --version`：返回兼容版本。
+- `codex app-server ...`：启动本适配器，包括 `proxy` 模式。
+- 其他命令：设置 `CODEX_REAL` 时转发给真实 Codex CLI，否则明确失败。
+
+## 配置
+
+| 环境变量 | 默认值 | 说明 |
+|---|---|---|
+| `CHRYS_CODEX_EXECUTABLE` | `chrys` | Chrys 二进制路径 |
+| `CHRYS_CODEX_AGENT` | `Code` | Chrys 主 Agent 名称 |
+| `CHRYS_CODEX_HOME` | `~/.chrys-codex` | 任务数据库、socket 和日志目录 |
+| `CHRYS_CODEX_ADAPTER` | 安装目录下的 `adapter.mjs` | shim 使用的适配器入口 |
+| `CHRYS_CODEX_NODE` | `node` | Node.js 24+ 可执行文件 |
+| `CHRYS_CODEX_COMPAT_VERSION` | `0.142.3` | shim 对 Codex App 报告的兼容版本 |
+| `CODEX_REAL` | 未设置 | 非 app-server 命令的官方 Codex CLI 回退路径 |
+
+## 开发验证
+
+```bash
+npm run typecheck
+npm test
+npm run smoke:chrys
+```
+
+协议兼容层派生自 MIT 许可的 `fuergaosi233/claude-codex`，具体见 `NOTICE` 和 `LICENSE`。

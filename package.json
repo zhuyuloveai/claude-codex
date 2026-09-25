@@ -1,20 +1,12 @@
 {
-  "name": "claude-codex-adapter",
+  "name": "chrys-codex-adapter",
   "version": "0.1.0",
   "private": true,
-  "description": "Remote-mode adapter that lets the Codex desktop app talk to Claude Code through the Codex app-server protocol.",
+  "description": "Codex app-server compatibility adapter for the Chrys ACP agent.",
   "license": "MIT",
-  "homepage": "https://fuergaosi233.github.io/claude-codex/",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/fuergaosi233/claude-codex.git"
-  },
-  "bugs": {
-    "url": "https://github.com/fuergaosi233/claude-codex/issues"
-  },
   "type": "module",
   "bin": {
-    "claude-codex-adapter": "dist/src/adapter.mjs"
+    "chrys-codex-adapter": "dist/src/adapter.mjs"
   },
   "files": [
     "dist/",
@@ -38,9 +30,11 @@
     "docs:preview": "vitepress preview docs",
     "test": "npm run build && node --test dist/test/*.mjs",
     "doctor": "node scripts/doctor.mjs",
+    "install:ssh-user": "npm run build && bash scripts/install-ssh-user.sh",
     "workflow": "npm run build && node dist/src/workflow-cli.mjs",
     "workflow:schedule": "npm run workflow -- schedule",
-    "smoke:real": "npm run build && node scripts/smoke-real-claude.mjs",
+    "smoke:real": "npm run build && node scripts/smoke-real-chrys.mjs",
+    "smoke:chrys": "npm run build && node scripts/smoke-real-chrys.mjs",
     "probe:capabilities": "npm run build && node scripts/probe-capabilities.mjs",
     "acceptance:local-remote": "npm run build && node scripts/acceptance-local-remote.mjs",
     "acceptance:gui-ssh-localhost": "npm run build && node scripts/acceptance-gui-ssh-localhost.mjs",
@@ -50,7 +44,7 @@
     "generate:schema": "codex app-server generate-ts --experimental --out generated/codex-app-server"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.3.283",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.280",
     "ws": "^8.21.3"
   },
   "devDependencies": {
