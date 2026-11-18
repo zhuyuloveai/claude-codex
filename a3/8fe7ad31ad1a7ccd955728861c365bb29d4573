@@ -1,0 +1,14 @@
+docs/antigravity-local.md
+  h_3a8df3cf4e70f0 111,114-115
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "a38fe7ad31ad1a7ccd955728861c365bb29d4573",
+  "prompts": {},
+  "humans": {
+    "h_3a8df3cf4e70f0": {
+      "author": "朱宇 <zhuyu@zhuyudeMacBook-Air.local>"
+    }
+  }
+}
