@@ -17,6 +17,36 @@ REAL_CODEX="${CODEX_REAL:-/usr/local/bin/codex}"
 test -f "$ROOT/dist/src/adapter.mjs"
 mkdir -p "$INSTALL_DIR" "$ROUTE_DIR/bin" "$STATE_DIR" "$HOME/.ssh"
 chmod 700 "$STATE_DIR" "$HOME/.ssh"
+
+# Freeze the existing daemon briefly before checking SQLite. A plain idle
+# check races a new App turn; freezing makes the check and restart exclusive.
+SERVICE="gui/$(id -u)/ai.antigravity.codex-adapter"
+RESTART_SERVICE=0
+FROZEN=0
+cleanup_upgrade() {
+  if [ "$FROZEN" = 1 ]; then launchctl kill SIGCONT "$SERVICE" >/dev/null 2>&1 || true; fi
+}
+trap cleanup_upgrade EXIT
+if launchctl print "$SERVICE" >/dev/null 2>&1; then
+  RESTART_SERVICE=1
+  launchctl kill SIGSTOP "$SERVICE"
+  FROZEN=1
+fi
+python3 - "$STATE_DIR/adapter/state.sqlite" <<'BACKUP'
+import datetime, pathlib, sqlite3, sys
+path = pathlib.Path(sys.argv[1])
+if path.exists():
+    source = sqlite3.connect('file:' + str(path) + '?mode=ro', uri=True)
+    active = source.execute("SELECT COUNT(*) FROM turns WHERE status = 'inProgress'").fetchone()[0]
+    if active:
+        raise SystemExit(f'Refusing upgrade: {active} turn(s) are still running. The existing daemon will resume unchanged.')
+    backup = path.with_name('state.before-upgrade.' + datetime.datetime.now().strftime('%Y%m%d%H%M%S') + '.sqlite')
+    with sqlite3.connect(str(backup)) as target:
+        source.backup(target)
+    backup.chmod(0o600)
+    source.close()
+    print('Database backup:', backup)
+BACKUP
 # Keep a rollback copy on upgrades; never delete the running release in place.
 if [ -d "$INSTALL_DIR/dist" ]; then
   mv "$INSTALL_DIR/dist" "$INSTALL_DIR/dist.backup.$(date +%Y%m%d%H%M%S)"
@@ -42,6 +72,11 @@ install -m 0755 "$ROOT/scripts/codex-shim" "$ROUTE_DIR/bin/codex"
   echo 'export CLAUDE_CODEX_VERSION_SUFFIX=antigravity-codex'
   echo 'export CLAUDE_CODEX_DISABLE_CODEX_PROXY=1'
   echo 'export CLAUDE_CODEX_IDLE_EXIT_MS=0'
+  echo 'export CLAUDE_CODEX_DYNAMIC_TOOLS=1'
+  echo 'export CLAUDE_CODEX_LEADER_TOOLS=1'
+  echo 'export CLAUDE_CODEX_APP_MCP_SERVERS=1'
+  echo 'export CLAUDE_CODEX_MEMORIES=1'
+  echo 'export CLAUDE_CODEX_SESSION_CHANGES=1'
 } > "$ROUTE_DIR/runtime.env"
 chmod 600 "$ROUTE_DIR/runtime.env"
 
@@ -120,3 +155,9 @@ PY
 fi
 
 printf 'Installed Antigravity adapter. Verify: ssh -o BatchMode=yes antigravity-local "codex --version"\n'
+
+if [ "$RESTART_SERVICE" = 1 ]; then
+  launchctl kickstart -k "$SERVICE"
+  FROZEN=0
+  echo 'Restarted the previously idle Antigravity daemon.'
+fi

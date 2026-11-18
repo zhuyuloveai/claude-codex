@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { mkdirSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
@@ -152,6 +153,15 @@ export class SessionStore {
       );
       CREATE INDEX IF NOT EXISTS idx_threads_updated ON threads(updated_at DESC);
       CREATE INDEX IF NOT EXISTS idx_turns_thread ON turns(thread_id, started_at);
+      CREATE TABLE IF NOT EXISTS antigravity_memories (
+        workspace TEXT PRIMARY KEY,
+        summary TEXT NOT NULL,
+        revision TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS thread_read_states (
+        thread_id TEXT PRIMARY KEY,
+        state_json TEXT NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS thread_sections (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -1364,6 +1374,89 @@ export class SessionStore {
     this.db.prepare('UPDATE threads SET claude_resume_at = NULL WHERE id = ?').run(threadId)
   }
 
+  workspaceMemory(workspace: string): { summary: string; revision: string } {
+    return (
+      (this.db
+        .prepare('SELECT summary, revision FROM antigravity_memories WHERE workspace = ?')
+        .get(workspace) as { summary: string; revision: string } | undefined) ?? {
+        summary: '',
+        revision: 'empty',
+      }
+    )
+  }
+
+  writeWorkspaceMemory(workspace: string, summary: string, expectedRevision: string) {
+    if (Buffer.byteLength(summary, 'utf8') > 32_768)
+      throw new Error('Workspace memory must not exceed 32 KiB')
+    if (this.workspaceMemory(workspace).revision !== expectedRevision)
+      throw new Error('Memory revision changed; read it again before updating')
+    this.db
+      .prepare(
+        'INSERT INTO antigravity_memories (workspace, summary, revision) VALUES (?, ?, ?) ON CONFLICT(workspace) DO UPDATE SET summary = excluded.summary, revision = excluded.revision',
+      )
+      .run(workspace, summary, newId())
+    return this.workspaceMemory(workspace)
+  }
+
+  resetWorkspaceMemories(): void {
+    this.db.prepare('DELETE FROM antigravity_memories').run()
+  }
+
+  threadReadState(threadId: string): {
+    firstUnread: { type: 'threadStart' } | { type: 'turn'; turnId: string } | null
+    revision: string
+  } {
+    const row = this.db
+      .prepare('SELECT state_json FROM thread_read_states WHERE thread_id = ?')
+      .get(threadId) as { state_json: string } | undefined
+    const saved = row
+      ? (JSON.parse(row.state_json) as {
+          unread: boolean
+          seen: Record<string, string>
+          nonce: string
+        })
+      : { unread: false, seen: {}, nonce: '' }
+    const current = this.readStateHashes(threadId)
+    const first = Object.keys(current).find((id) => saved.seen[id] !== current[id])
+    return {
+      firstUnread: saved.unread
+        ? { type: 'threadStart' }
+        : first
+          ? { type: 'turn', turnId: first }
+          : null,
+      revision: createHash('sha256')
+        .update(JSON.stringify([current, saved]))
+        .digest('hex'),
+    }
+  }
+
+  updateThreadReadState(threadId: string, revision: string, operation: 'read' | 'unread') {
+    if (this.threadReadState(threadId).revision !== revision)
+      throw new Error('Read state revision conflict; refresh the thread before marking it')
+    const state = {
+      unread: operation === 'unread',
+      seen: this.readStateHashes(threadId),
+      nonce: newId(),
+    }
+    this.db
+      .prepare(
+        'INSERT INTO thread_read_states (thread_id, state_json) VALUES (?, ?) ON CONFLICT(thread_id) DO UPDATE SET state_json = excluded.state_json',
+      )
+      .run(threadId, JSON.stringify(state))
+    return this.threadReadState(threadId)
+  }
+
+  private readStateHashes(threadId: string): Record<string, string> {
+    return Object.fromEntries(
+      this.historyTurns(threadId).map((turn) => [
+        turn.id,
+        createHash('sha256')
+          .update(JSON.stringify([turn.status, turn.items, turn.error]))
+          .digest('hex'),
+      ]),
+    )
+  }
+
   // A thread's history as clients see it: the turns it was forked with, then
   // its own. As in Codex, a fork holds a copy of the turns it inherited, ids
   // and all, so they outlive a rollback or delete of the thread it came from.
@@ -1634,6 +1727,7 @@ export class SessionStore {
       this.db.prepare('DELETE FROM thread_goals WHERE thread_id = ?').run(id)
       this.db.prepare('DELETE FROM thread_queues WHERE thread_id = ?').run(id)
       this.db.prepare('DELETE FROM thread_dynamic_tools WHERE thread_id = ?').run(id)
+      this.db.prepare('DELETE FROM thread_read_states WHERE thread_id = ?').run(id)
       this.db.prepare('DELETE FROM thread_injected_items WHERE thread_id = ?').run(id)
       this.db.prepare('DELETE FROM thread_attachments WHERE thread_id = ?').run(id)
       // Only the thread's own link: threads it led keep theirs, so they

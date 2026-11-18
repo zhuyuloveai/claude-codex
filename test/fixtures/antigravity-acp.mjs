@@ -60,6 +60,7 @@ createInterface({ input: process.stdin }).on('line', (line) => {
       return reply(promptId, { stopReason: 'end_turn' })
     }
     promptId = message.id
+    if (scenario === 'usage') update({ sessionUpdate: 'usage_update', used: 120000, size: 200000 })
     update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'LIVE' } })
     if (scenario === 'cancel' || scenario === 'steer') return
     const toolCall = {

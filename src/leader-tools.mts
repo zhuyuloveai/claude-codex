@@ -78,6 +78,7 @@ export function leaderMaxRunning(): number {
 
 // What the leader tools need from the app-server.
 export interface LeaderHost {
+  stopThread?(threadId: string): Promise<void>
   readonly store: SessionStore
   // The thread's running turn, if any.
   activeTurnId(threadId: string): string | null
@@ -133,6 +134,16 @@ export class LeaderThreads {
     const cached = this.handlers.get(leaderId)
     if (cached) return cached
     const handlers: LeaderToolHandlers = {
+      ...(this.host.stopThread
+        ? {
+            stop: async (input: { threadId: string }) => {
+              this.leader(leaderId)
+              const thread = this.child(leaderId, input.threadId)
+              await this.host.stopThread!(thread.id)
+              return JSON.stringify({ threadId: thread.id, stopped: true })
+            },
+          }
+        : {}),
       list: async (input) => this.list(leaderId, input.scope),
       start: async (input) => this.start(leaderId, input),
       prompt: async (input, signal) => this.prompt(leaderId, input, signal),

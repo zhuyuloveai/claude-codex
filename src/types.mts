@@ -525,6 +525,8 @@ export interface RuntimeTurnContext {
   effort: string | null
   claudeSessionId: string | null
   forkSession: boolean
+  // Portable history for ACP backends without native fork/checkpoint APIs.
+  replayHistory?: ThreadItem[]
   // Resume claudeSessionId only up to this transcript entry, in a forked
   // session (thread rewind or fork). Backends that cannot truncate ignore it.
   resumeSessionAt?: string | null
@@ -597,6 +599,11 @@ export interface RuntimeTurnContext {
   // false to have the runtime switch auto-memory off. Unset leaves it to
   // Claude Code's own settings.
   autoMemory?: boolean
+  // Adapter-owned workspace notes, independent of the backend's native memory.
+  memoryTools?: {
+    read(): Promise<string>
+    write(summary: string, expectedRevision: string): Promise<string>
+  } | null
   // The auto-compact window, in tokens, of the thread's Claude sessions: set
   // only when the user set Codex's model_auto_compact_token_limit. Unset
   // leaves Claude Code's own window.
@@ -632,6 +639,7 @@ export interface GoalToolHandlers {
 // here), a thrown Error becomes an error result. `signal` aborts a wait when
 // Claude's tool call is cancelled.
 export interface LeaderToolHandlers {
+  stop?(input: { threadId: string }): Promise<string>
   list(input: { scope?: string | undefined }): Promise<string>
   start(input: {
     prompt: string

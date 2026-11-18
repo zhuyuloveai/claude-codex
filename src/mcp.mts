@@ -435,6 +435,24 @@ async function runMcpRequest(
   }
 }
 
+// ACP bridges use the turn's already-resolved config rather than re-reading
+// global settings (which could have changed since the turn started).
+export async function configuredMcpRequest(
+  name: string,
+  config: Record<string, unknown>,
+  method: string,
+  params: unknown,
+  signal?: AbortSignal,
+): Promise<unknown> {
+  const connection =
+    config.type === 'http' ? await connectHttp(config, signal) : await connectMcp(name, config)
+  try {
+    return await connection.request(method, params)
+  } finally {
+    connection.close()
+  }
+}
+
 // A connection to a server the adapter reaches itself, past the initialize
 // handshake: the server's reply to it, and requests over the same connection.
 interface McpConnection {
@@ -581,7 +599,10 @@ async function connectStdio(
 // request takes a JSON reply or an event stream, and carries the session id
 // the server gave on initialize, a session that ends with the connection.
 // All requests share one deadline, as a stdio server's do.
-async function connectHttp(config: Record<string, unknown>): Promise<McpConnection> {
+async function connectHttp(
+  config: Record<string, unknown>,
+  parentSignal?: AbortSignal,
+): Promise<McpConnection> {
   const url = stringOr(config.url, '')
   if (!url) throw new Error('HTTP MCP server has no url')
   // fetch refuses a url with credentials, and its error repeats the url.
@@ -594,7 +615,10 @@ async function connectHttp(config: Record<string, unknown>): Promise<McpConnecti
   if (target.username || target.password) {
     throw new Error('HTTP MCP server url has credentials in it, which fetch refuses')
   }
-  const signal = AbortSignal.timeout(mcpTimeoutMs())
+  const signal = AbortSignal.any([
+    AbortSignal.timeout(mcpTimeoutMs()),
+    ...(parentSignal ? [parentSignal] : []),
+  ])
   const headers: Record<string, string> = {
     'content-type': 'application/json',
     accept: 'application/json, text/event-stream',

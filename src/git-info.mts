@@ -8,7 +8,9 @@ const execFileAsync = promisify(execFile)
 // run git. Lookups happen when a thread starts, resumes without one, or ends a
 // turn, and are cached per directory so a burst of them costs one lookup.
 const GIT_INFO_TTL_MS = 30_000
-const GIT_TIMEOUT_MS = 1_000
+// macOS may take over a second to launch a newly-created PATH wrapper,
+// especially while other app-server processes start concurrently.
+const GIT_TIMEOUT_MS = 5_000
 const MAX_CACHED_DIRECTORIES = 256
 
 const gitInfoCache = new Map<string, { at: number; info: Promise<GitInfo | null> }>()

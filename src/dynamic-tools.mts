@@ -78,7 +78,10 @@ export function parseDynamicTools(value: unknown): DynamicToolSpec[] {
 // The MCP servers Claude gets for a thread's tools: one per namespace, and
 // one for the tools without a namespace. A tool whose full name would pass
 // Claude's limit is left out.
-export function dynamicToolServers(specs: readonly DynamicToolSpec[]): DynamicToolServer[] {
+export function dynamicToolServers(
+  specs: readonly DynamicToolSpec[],
+  nameLimit = CLAUDE_TOOL_NAME_MAX,
+): DynamicToolServer[] {
   const groups: Array<{
     server: string
     namespace: string | null
@@ -106,7 +109,7 @@ export function dynamicToolServers(specs: readonly DynamicToolSpec[]): DynamicTo
   for (const group of groups) {
     const tools: DynamicToolServer['tools'] = []
     for (const tool of group.tools) {
-      if (`mcp__${group.server}__${tool.name}`.length > CLAUDE_TOOL_NAME_MAX) {
+      if (`mcp__${group.server}__${tool.name}`.length > nameLimit) {
         debugLog('dynamicTools.skipped', { server: group.server, tool: tool.name, reason: 'name' })
         continue
       }

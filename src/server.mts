@@ -1,7 +1,7 @@
 import { type ChildProcess, execFile, spawn } from 'node:child_process'
 import { existsSync, type FSWatcher, readFileSync, watch, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { dirname, isAbsolute, join } from 'node:path'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { antigravityModelOptions, useAntigravityRuntime } from './antigravity-catalog.mjs'
@@ -765,6 +765,14 @@ export class CodexClaudeAppServer {
       activeTurnId: (threadId) => this.activeTurnByThread.get(threadId) ?? null,
       startThread: (leader, options) => this.startLeaderThread(leader, options),
       sendInput: (threadId, text) => this.sendLeaderInput(threadId, text),
+      stopThread: async (threadId) => {
+        const turnId = this.activeTurnByThread.get(threadId)
+        if (turnId)
+          await this.turnInterrupt(this.peerForThread(threadId) ?? DETACHED_PEER, {
+            threadId,
+            turnId,
+          })
+      },
     })
     this.subagentItems = new SubagentItems({
       store,
@@ -1062,6 +1070,10 @@ export class CodexClaudeAppServer {
       // the App never made. The App reports the failure.
       // App rule: memories-settings
       case 'memory/reset':
+        if (useAntigravityRuntime()) {
+          this.store.resetWorkspaceMemories()
+          return {}
+        }
         throw new Error(
           "memory/reset is not supported: Claude Code keeps its memories in its own per-project folders, shared with Claude Code outside the App. Review or delete them with Claude Code's /memory command.",
         )
@@ -1383,8 +1395,16 @@ export class CodexClaudeAppServer {
             })),
         }
       }
-      case 'thread/memory/read':
-        return { summary: null }
+      case 'thread/memory/read': {
+        if (!useAntigravityRuntime()) return { summary: null }
+        const thread = this.store.getThread(stringOr(asRecord(params).threadId, ''))
+        if (!thread) throw unknownThread(stringOr(asRecord(params).threadId, ''))
+        return {
+          summary: this.autoMemoryFor(thread)
+            ? this.store.workspaceMemory(thread.cwd).summary || null
+            : null,
+        }
+      }
       case 'modelProvider/list':
         return {
           data: [],
@@ -1395,8 +1415,28 @@ export class CodexClaudeAppServer {
               : 'claude-code',
           canChangeDefault: false,
         }
+      case 'thread/readState/update': {
+        if (!useAntigravityRuntime()) throw methodNotFound(method)
+        const request = asRecord(params)
+        const threadId = stringOr(request.threadId, '')
+        if (!this.store.getThread(threadId)) throw unknownThread(threadId)
+        const operation = asRecord(request.operation).type
+        if (operation !== 'read' && operation !== 'unread')
+          throw invalidRequest('operation must be read or unread')
+        let readState: ReturnType<SessionStore['threadReadState']>
+        try {
+          readState = this.store.updateThreadReadState(
+            threadId,
+            stringOr(request.expectedRevision, ''),
+            operation,
+          )
+        } catch (error) {
+          throw invalidRequest(error instanceof Error ? error.message : String(error))
+        }
+        this.notifyAll({ method: 'thread/readState/changed', params: { threadId, readState } })
+        return { readState }
+      }
       case 'thread/prediction/request':
-      case 'thread/readState/update':
         throw methodNotFound(method)
       default: {
         const result = hostMethod(method, asRecord(params))
@@ -1914,6 +1954,13 @@ export class CodexClaudeAppServer {
     const last = threads.at(-1)
     return {
       data: threads.map((thread) => this.toThread(thread, [])),
+      ...(useAntigravityRuntime()
+        ? {
+            readStates: Object.fromEntries(
+              threads.map((thread) => [thread.id, this.store.threadReadState(thread.id)]),
+            ),
+          }
+        : {}),
       nextCursor: last && threads.length >= query.limit ? query.cursorOf(last) : null,
       backwardsCursor: threads[0] ? query.cursorOf(threads[0]) : null,
     }
@@ -2209,7 +2256,10 @@ export class CodexClaudeAppServer {
     // App rule: subagent-read
     const includeTurns = params.includeTurns !== false || thread.threadSource === 'subagent'
     const turns = includeTurns ? this.store.historyTurns(threadId) : []
-    return { thread: this.toThread(thread, turns) }
+    return {
+      thread: this.toThread(thread, turns),
+      ...(useAntigravityRuntime() ? { readState: this.store.threadReadState(threadId) } : {}),
+    }
   }
 
   // The App pages a long thread from its newest turn, and loads a search
@@ -2697,6 +2747,45 @@ export class CodexClaudeAppServer {
       changes: async (input, session) => {
         const thread = this.store.getThread(threadId)
         if (!thread) throw new Error('This chat no longer exists.')
+        if (useAntigravityRuntime()) {
+          let turns = this.store.historyTurns(threadId)
+          if (input.turns) turns = turns.slice(-input.turns)
+          const wanted = input.paths?.map((path) => resolve(session.cwd, path))
+          const patches = turns.flatMap((turn) =>
+            turn.items.flatMap((item) =>
+              item.type === 'fileChange'
+                ? item.changes
+                    .filter(
+                      (change) =>
+                        !wanted?.length ||
+                        wanted.some(
+                          (path) =>
+                            resolve(session.cwd, change.path) === path ||
+                            resolve(session.cwd, change.path).startsWith(`${path}/`),
+                        ),
+                    )
+                    .map((change) => ({
+                      turnId: turn.id,
+                      path: change.path,
+                      kind: change.kind,
+                      ...(input.stat ? {} : { diff: change.diff }),
+                    }))
+                : [],
+            ),
+          )
+          const report = JSON.stringify(
+            {
+              description:
+                'Recorded per-turn file patches, not a recomputed net working-tree diff. Shell changes may be absent.',
+              patches,
+            },
+            null,
+            2,
+          )
+          if (report.length > 120_000)
+            throw new Error('Recorded patches exceed 120 KB; narrow paths or turns')
+          return report
+        }
         const marks = this.store.turnCheckpoints(threadId)
         const sessions = new Map<string, string | null>()
         for (const { checkpoint } of marks)
@@ -4555,7 +4644,10 @@ export class CodexClaudeAppServer {
     // The tools the client registered when it started the thread.
     const dynamicTools =
       turnPurpose === 'normal' && !isCodexThread && !thread.ephemeral && dynamicToolsEnabled()
-        ? dynamicToolServers(this.store.getDynamicTools(thread.id))
+        ? dynamicToolServers(
+            this.store.getDynamicTools(thread.id),
+            useAntigravityRuntime() ? Infinity : undefined,
+          )
         : []
     // For codex-backed threads, force the per-turn runtimeType to 'codex-proxy'
     // so the SelectableRuntime dispatches to CodexProxyRuntime instead of
@@ -4578,6 +4670,14 @@ export class CodexClaudeAppServer {
       effort: resolvedEffort,
       claudeSessionId: isCodexThread ? thread.codexSessionId : thread.claudeSessionId,
       forkSession,
+      ...(useAntigravityRuntime() && (forkSession || resumeSessionAt)
+        ? {
+            replayHistory: this.store
+              .historyTurns(thread.id)
+              .filter((entry) => entry.id !== turnId)
+              .flatMap((entry) => entry.items),
+          }
+        : {}),
       resumeSessionAt,
       // createdAt is in whole seconds: the history a fork copies from its
       // parent is older than the second after it.
@@ -4630,6 +4730,20 @@ export class CodexClaudeAppServer {
         turnPurpose === 'normal' && !isCodexThread && sessionChangesEnabled()
           ? this.sessionChangesFor(thread.id)
           : null,
+      ...(useAntigravityRuntime() && memoriesMappingEnabled() && this.autoMemoryFor(thread)
+        ? {
+            memoryTools: {
+              read: async () => {
+                if (!this.autoMemoryFor(thread)) throw new Error('Memory is disabled for this chat')
+                return JSON.stringify(this.store.workspaceMemory(turnCwd))
+              },
+              write: async (summary: string, revision: string) => {
+                if (!this.autoMemoryFor(thread)) throw new Error('Memory is disabled for this chat')
+                return JSON.stringify(this.store.writeWorkspaceMemory(turnCwd, summary, revision))
+              },
+            },
+          }
+        : {}),
       // Without the memories mapping the runtime leaves auto-memory to
       // Claude Code's own settings.
       ...(memoriesMappingEnabled()
@@ -7714,7 +7828,10 @@ export class CodexClaudeAppServer {
   private appToolNoteOptions(thread: ThreadRecord): AppToolNoteOptions {
     const available = new Set<string>()
     if (!thread.ephemeral && dynamicToolsEnabled())
-      for (const server of dynamicToolServers(this.store.getDynamicTools(thread.id)))
+      for (const server of dynamicToolServers(
+        this.store.getDynamicTools(thread.id),
+        useAntigravityRuntime() ? Infinity : undefined,
+      ))
         for (const tool of server.tools) available.add(tool.name)
     const leader = this.leaderThreads.allowed(thread)
     if (leader) for (const tool of LEADER_APP_THREAD_TOOLS) available.add(tool)
@@ -10312,7 +10429,13 @@ export class CodexClaudeAppServer {
     try {
       const current = this.store.getTurn(turn.id)
       if (current && current.status !== 'inProgress') return null
-      return this.store.completeTurn(turn.id, status, error) ?? turn
+      const ended = this.store.completeTurn(turn.id, status, error) ?? turn
+      if (useAntigravityRuntime())
+        this.notifyAll({
+          method: 'thread/readState/changed',
+          params: { threadId: turn.threadId, readState: this.store.threadReadState(turn.threadId) },
+        })
+      return ended
     } catch (storeError) {
       debugLog('turn.persist_failed', {
         threadId: turn.threadId,

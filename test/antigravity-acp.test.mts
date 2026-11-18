@@ -192,3 +192,125 @@ test('explicit Antigravity wins over inherited Chrys executable configuration', 
   )
   assert.equal(resolveRuntimeConfig({ CHRYS_CODEX_EXECUTABLE: '/bin/chrys' }).type, 'chrys-acp')
 })
+
+test('Antigravity forks reconstruct only retained App history in a new session', async () => {
+  await fixture('normal', async (runtime, home, log) => {
+    const events: RuntimeEvent[] = []
+    await runtime.runTurn(
+      context(home, {
+        claudeSessionId: 'parent',
+        forkSession: true,
+        resumeSessionAt: 'agy-replay:old',
+        replayHistory: [
+          {
+            type: 'agentMessage',
+            id: 'old',
+            text: 'RETAINED_ONLY',
+            phase: null,
+            memoryCitation: null,
+          },
+        ],
+      }),
+      {
+        onEvent: (event) => {
+          events.push(event)
+        },
+        onPermissionRequest: async () => ({ decision: 'accept' }),
+      },
+    )
+    const wire = (await readFile(log, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+    assert.ok(wire.some((message) => message.method === 'session/new'))
+    assert.ok(!wire.some((message) => message.method === 'session/load'))
+    assert.match(
+      JSON.stringify(wire.find((message) => message.method === 'session/prompt')),
+      /RETAINED_ONLY/,
+    )
+    assert.ok(events.some((event) => event.type === 'checkpoint'))
+    assert.ok(events.some((event) => event.type === 'notice'))
+  })
+})
+
+test('Antigravity compaction commits a fresh session only after successful summary and seeding', async () => {
+  await fixture('normal', async (runtime, home, log) => {
+    const events: RuntimeEvent[] = []
+    await runtime.runTurn(context(home, { prompt: '/compact', claudeSessionId: 'parent' }), {
+      onEvent: (event) => {
+        events.push(event)
+      },
+      onPermissionRequest: async () => ({ decision: 'accept' }),
+    })
+    const wire = (await readFile(log, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+    assert.equal(wire.filter((message) => message.method === 'session/load').length, 1)
+    assert.equal(wire.filter((message) => message.method === 'session/new').length, 1)
+    assert.equal(events.filter((event) => event.type === 'session').length, 1)
+    assert.ok(events.some((event) => event.type === 'compaction_completed'))
+  })
+})
+
+test('Antigravity in-flight effort uses ACP and rejects an unavailable level', async () => {
+  await fixture('steer', async (runtime, home) => {
+    let ready!: () => void
+    const started = new Promise<void>((resolve) => {
+      ready = resolve
+    })
+    const running = runtime.runTurn(context(home), {
+      onEvent: (event) => {
+        if (event.type === 'text_delta' && event.delta === 'LIVE') ready()
+      },
+      onPermissionRequest: async () => ({ decision: 'cancel' }),
+    })
+    await started
+    assert.equal(await runtime.updateTurnSettings('thread', 'turn', { effort: 'medium' }), true)
+    await assert.rejects(
+      runtime.updateTurnSettings('thread', 'turn', { effort: 'max' }),
+      /does not offer reasoning effort/,
+    )
+    await runtime.steer('thread', 'finish')
+    await running
+  })
+})
+
+test('Antigravity deny rules win even if the App approval handler would accept', async () => {
+  await fixture('normal', async (runtime, home, log) => {
+    await runtime.runTurn(context(home, { disallowedTools: ['Bash'] }), {
+      onEvent: () => {},
+      onPermissionRequest: async () => {
+        throw new Error('deny rule must not ask')
+      },
+    })
+    assert.match(await readFile(log, 'utf8'), /"optionId":"no"/)
+  })
+})
+
+test('Antigravity auto-compacts only from explicit ACP context occupancy', async () => {
+  await fixture('usage', async (runtime, home, log) => {
+    const events: RuntimeEvent[] = []
+    const handlers = {
+      onEvent: (event: RuntimeEvent) => {
+        events.push(event)
+      },
+      onPermissionRequest: async () => ({ decision: 'accept' as const }),
+    }
+    await runtime.runTurn(context(home), handlers)
+    events.length = 0
+    await runtime.runTurn(
+      context(home, { claudeSessionId: 'agy-session', autoCompactWindow: 100000, turnId: 'next' }),
+      handlers,
+    )
+    assert.ok(
+      events.some((event) => event.type === 'compaction_completed' && event.trigger === 'auto'),
+    )
+    assert.equal(events.filter((event) => event.type === 'completed').length, 1)
+    const wire = (await readFile(log, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+    assert.equal(wire.filter((message) => message.method === 'session/prompt').length, 4)
+  })
+})
