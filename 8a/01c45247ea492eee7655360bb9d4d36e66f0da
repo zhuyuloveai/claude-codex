@@ -1,0 +1,22 @@
+docs/antigravity-local.md
+  h_3a8df3cf4e70f0 72-75
+scripts/smoke-antigravity-tools.mjs
+  h_3a8df3cf4e70f0 3,5,66-76
+src/antigravity-tool-bridge.mts
+  h_3a8df3cf4e70f0 8,53-61
+src/antigravity-tool-schema.mts
+  h_3a8df3cf4e70f0 1-85
+test/antigravity-tool-schema.test.mts
+  h_3a8df3cf4e70f0 1-52
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "8a01c45247ea492eee7655360bb9d4d36e66f0da",
+  "prompts": {},
+  "humans": {
+    "h_3a8df3cf4e70f0": {
+      "author": "朱宇 <zhuyu@zhuyudeMacBook-Air.local>"
+    }
+  }
+}
