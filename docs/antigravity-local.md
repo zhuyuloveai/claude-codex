@@ -108,10 +108,11 @@ macOS 使用 `TMPDIR=/tmp` 可避免上游两项错误信息断言因系统临�
 
 本机 2026-11-18 验收：
 
-- 全量 831 项测试通过；之后补充辅助任务模型路由回归，相关 43 项通过。
+- 全量 831 项测试通过；之后补充辅助任务模型路由回归，相关 43 项通过；最终 ACP/当前 App 回归 10 项通过。
 - Chrys 真实三轮 smoke 通过。
 - Antigravity stdio smoke：9 个模型组、重启恢复记忆、审批、文件与 diff 均通过。
-- Antigravity SSH smoke：9 个模型组、审批、文件、diff、按 ID 读取历史条目均通过。
+- Antigravity SSH smoke：9 个模型组、审批、文件、diff、按 ID 读取历史条目和真实任务中断均通过。
+- Rust workspace 的 3 项测试通过。
 - Rust 协议 fixture 与本机官方 CLI `0.169.0-alpha.11.1` 匹配。
 - App GUI 注册/展示验收仍待用户完成。
 
