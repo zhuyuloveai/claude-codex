@@ -1,0 +1,60 @@
+docs/antigravity-local.md
+  h_3a8df3cf4e70f0 37-39,63-132
+package-lock.json
+  h_3a8df3cf4e70f0 13,2401-2402,2920,2939,3244
+package.json
+  h_3a8df3cf4e70f0 58
+scripts/install-antigravity-local.sh
+  h_3a8df3cf4e70f0 20-49,75-79,158-163
+scripts/smoke-antigravity-features.mjs
+  h_3a8df3cf4e70f0 1-152
+scripts/smoke-antigravity-ssh-tools.mjs
+  h_3a8df3cf4e70f0 1-142
+scripts/smoke-antigravity-tools.mjs
+  h_3a8df3cf4e70f0 1-87
+src/antigravity-acp-runtime.mts
+  h_3a8df3cf4e70f0 7-10,17,25-27,34-36,46-75,78-79,81,83-87,89,94,96,99,107-115,118-120,160-181,189,191-199,202,221,228,232-238,243-248,250-252,261-264,292-300,311,340,352-470,472-473,503,526-527,541,548-560,569-573
+src/antigravity-input.mts
+  h_3a8df3cf4e70f0 1-40
+src/antigravity-mcp-relay.mts
+  h_3a8df3cf4e70f0 1-20
+src/antigravity-output.mts
+  h_3a8df3cf4e70f0 1-28
+src/antigravity-tool-bridge.mts
+  h_3a8df3cf4e70f0 1-499
+src/dynamic-tools.mts
+  h_3a8df3cf4e70f0 81-84,112
+src/git-info.mts
+  h_3a8df3cf4e70f0 11-13
+src/leader-tools.mts
+  h_3a8df3cf4e70f0 81,137-146
+src/mcp.mts
+  h_3a8df3cf4e70f0 438-455,602-605,618-621
+src/server.mts
+  h_3a8df3cf4e70f0 4,768-775,1073-1076,1398-1407,1418-1438,1957-1963,2259-2262,2750-2788,4647-4650,4673-4680,4733-4746,7831-7834,10432-10438
+src/store.mts
+  h_3a8df3cf4e70f0 1,156-164,1377-1459,1730
+src/types.mts
+  h_3a8df3cf4e70f0 528-529,602-606,642
+test/antigravity-acp.test.mts
+  h_3a8df3cf4e70f0 195-316
+test/antigravity-features.test.mts
+  h_3a8df3cf4e70f0 1-202
+test/antigravity-tool-bridge.test.mts
+  h_3a8df3cf4e70f0 1-220
+test/antigravity-upgrade.test.mts
+  h_3a8df3cf4e70f0 1-52
+test/fixtures/antigravity-acp.mjs
+  h_3a8df3cf4e70f0 63
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "fa9f03278c272a74608560c047bb73fd8edf0853",
+  "prompts": {},
+  "humans": {
+    "h_3a8df3cf4e70f0": {
+      "author": "朱宇 <zhuyu@zhuyudeMacBook-Air.local>"
+    }
+  }
+}
