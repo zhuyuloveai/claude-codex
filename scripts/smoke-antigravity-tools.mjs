@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import assert from 'node:assert/strict'
-import { mkdtemp, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises'
 import { AntigravityAcpRuntime } from '../dist/src/antigravity-acp-runtime.mjs'
+import { dynamicToolServers } from '../dist/src/dynamic-tools.mjs'
 
 const home = await mkdtemp('/tmp/agy-tools-smoke-')
 process.env.CLAUDE_CODEX_HOME = home
@@ -61,6 +62,17 @@ const context = {
       throw new Error('Not requested')
     },
   },
+}
+if (process.env.ANTIGRAVITY_SMOKE_TOOL_SPECS) {
+  context.dynamicTools.push(
+    ...dynamicToolServers(
+      JSON.parse(await readFile(process.env.ANTIGRAVITY_SMOKE_TOOL_SPECS, 'utf8')),
+      Infinity,
+    ),
+  )
+  console.log(
+    `Testing ${context.dynamicTools.reduce((n, server) => n + server.tools.length, 0)} registered tools`,
+  )
 }
 try {
   await runtime.runTurn(context, {

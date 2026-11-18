@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { createInterface } from 'node:readline'
 import { fileURLToPath } from 'node:url'
 import { acpRecord } from './acp-process.mjs'
+import { antigravityToolSchema } from './antigravity-tool-schema.mjs'
 import { askRuleCovers } from './ask-rules.mjs'
 import { dynamicToolCallResult } from './dynamic-tools.mjs'
 import {
@@ -49,7 +50,15 @@ export async function antigravityToolBridge(
   const registry = new Map<string, Tool>()
   const add = (tool: Tool) => {
     if (registry.has(tool.name)) throw new Error(`Duplicate bridge tool: ${tool.name}`)
-    registry.set(tool.name, tool)
+    const adapted = antigravityToolSchema(tool.inputSchema)
+    registry.set(tool.name, {
+      ...tool,
+      inputSchema: adapted.schema,
+      call: async (args, signal) => {
+        adapted.validate(args)
+        return tool.call(args, signal)
+      },
+    })
   }
   if (!context.planMode && context.sandboxMode !== 'read-only' && handlers.onDynamicToolCall) {
     for (const server of context.dynamicTools ?? [])

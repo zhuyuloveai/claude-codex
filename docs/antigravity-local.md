@@ -69,6 +69,10 @@ ssh -o BatchMode=yes antigravity-local 'codex --version'
 - App 动态工具通过每轮独立的 Unix socket MCP 桥往返 `item/tool/call`。目录 0700、
   socket 0600；中断会取消调用并清理 relay。长工具名使用带哈希的短名，对 App 保留原名。
   App 必须实际向连接注册工具；工具不会凭空出现，旧聊天可能需要新建聊天才能获得注册。
+  App 工具参数使用 ECMAScript 正则，Antigravity 的 Go/RE2 不支持前瞻等语法。桥接层发布
+  不含正则约束的兼容 schema，并在调用工具之前用原始 schema 校验参数，避免放行保留名称。
+  真实 App 的 33 个工具已作为复现集通过模型验收；结果 `/tmp/agy-tools-smoke-zfNpPy/report.json`。
+  可用 `ANTIGRAVITY_SMOKE_TOOL_SPECS=/path/to/specs.json node scripts/smoke-antigravity-tools.mjs` 复测。
 - 目标工具 `get_goal/create_goal/update_goal` 接入现有目标预算与续跑机制。
 - 同一适配器的聊天协作：list/read/start/prompt/wait/stop；写入和停止仅限该聊天创建的子聊天。
   独立聊天可以并发运行，最多并发数沿用上游设置。它不等于原生 Agent 子代理卡片。
