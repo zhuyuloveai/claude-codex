@@ -1,0 +1,16 @@
+src/antigravity-catalog.mts
+  h_3a8df3cf4e70f0 8-15,83,85,110-113
+test/antigravity-catalog.test.mts
+  h_3a8df3cf4e70f0 1-65
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "24b9a1852d812c43ebe37b747d6dadf59be23bd6",
+  "prompts": {},
+  "humans": {
+    "h_3a8df3cf4e70f0": {
+      "author": "朱宇 <zhuyu@zhuyudeMacBook-Air.local>"
+    }
+  }
+}
