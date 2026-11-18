@@ -1,3 +1,4 @@
+import { AntigravityAcpRuntime } from './antigravity-acp-runtime.mjs'
 import { ChrysAcpRuntime } from './chrys-acp-runtime.mjs'
 import { ClaudePTranscriptRuntime } from './claude-p-runtime.mjs'
 import { CodexProxyRuntime } from './codex-proxy-runtime.mjs'
@@ -9,7 +10,16 @@ import {
   type RuntimeConfig,
   resolveRuntimeConfig,
 } from './runtime-config.mjs'
-import type { ClaudeRuntime, RuntimeHandlers, RuntimeTurnContext } from './types.mjs'
+import type {
+  ClaudeRuntime,
+  RuntimeBackgroundListener,
+  RuntimeHandlers,
+  RuntimeLiveTask,
+  RuntimeMcpServerStatus,
+  RuntimeSteerOptions,
+  RuntimeTurnContext,
+  RuntimeTurnSettings,
+} from './types.mjs'
 import { debugLog } from './util.mjs'
 
 export function createRuntime(): ClaudeRuntime {
@@ -25,6 +35,7 @@ export function createRuntime(): ClaudeRuntime {
 class SelectableRuntime implements ClaudeRuntime {
   private runtimes = new Map<RuntimeBackendType, ClaudeRuntime>()
   private activeRuntimeByThread = new Map<string, ClaudeRuntime>()
+  private listener: RuntimeBackgroundListener | null = null
   private readonly config: RuntimeConfig
 
   constructor(config: RuntimeConfig) {
@@ -48,6 +59,13 @@ class SelectableRuntime implements ClaudeRuntime {
       return
     }
 
+    // Only the native runtime starts a profile's own Claude Code process;
+    // another would run the turn with the adapter's own provider settings.
+    if (context.modelProfileId && !runsModelProfiles(requestedType)) {
+      throw new Error(
+        `model process profile ${context.modelProfileId} needs the native Claude runtime, not ${requestedType}`,
+      )
+    }
     const runtime = this.runtimeFor(requestedType)
     debugLog('runtime.turn.select', {
       threadId: context.threadId,
@@ -58,9 +76,19 @@ class SelectableRuntime implements ClaudeRuntime {
       model: context.model,
       effort: context.effort,
     })
+    // Only an Agent SDK session has Claude Code's auto mode.
+    // App rule: auto-review
+    let turnContext = context
+    if (context.autoReview && !runsAutoReview(requestedType)) {
+      await handlers.onEvent({
+        type: 'auto_review_unavailable',
+        reason: `The ${requestedType} runtime has no auto mode`,
+      })
+      turnContext = { ...context, autoReview: false }
+    }
     this.activeRuntimeByThread.set(context.threadId, runtime)
     try {
-      await runtime.runTurn(context, handlers)
+      await runtime.runTurn(turnContext, handlers)
     } finally {
       if (this.activeRuntimeByThread.get(context.threadId) === runtime) {
         this.activeRuntimeByThread.delete(context.threadId)
@@ -68,9 +96,29 @@ class SelectableRuntime implements ClaudeRuntime {
     }
   }
 
-  async steer(threadId: string, prompt: string): Promise<void> {
+  async steer(
+    threadId: string,
+    prompt: string,
+    options?: RuntimeSteerOptions,
+  ): Promise<boolean | undefined> {
     const runtime = this.activeRuntimeByThread.get(threadId) ?? this.runtimeFor(this.config.type)
-    await runtime.steer(threadId, prompt)
+    return runtime.steer(threadId, prompt, options)
+  }
+
+  async updateTurnSettings(
+    threadId: string,
+    turnId: string,
+    settings: RuntimeTurnSettings,
+  ): Promise<boolean> {
+    const runtime = this.activeRuntimeByThread.get(threadId)
+    if (!runtime) return false
+    // A backend without auto mode leaves the reviewer change to its next
+    // turn, which reports it unavailable.
+    if (!runtime.updateTurnSettings && settings.model == null && settings.effort == null)
+      return true
+    if (!runtime.updateTurnSettings)
+      throw new Error('this backend cannot change the settings of a running turn')
+    return runtime.updateTurnSettings(threadId, turnId, settings)
   }
 
   async interrupt(threadId: string): Promise<void> {
@@ -82,17 +130,98 @@ class SelectableRuntime implements ClaudeRuntime {
     await Promise.allSettled([...this.runtimes.values()].map((entry) => entry.interrupt(threadId)))
   }
 
+  async abandonTurn(threadId: string, turnId: string): Promise<boolean> {
+    const runtime = this.activeRuntimeByThread.get(threadId)
+    return (await runtime?.abandonTurn?.(threadId, turnId)) === true
+  }
+
   async stop(): Promise<void> {
     await Promise.allSettled([...this.runtimes.values()].map((runtime) => runtime.stop()))
+  }
+
+  setBackgroundListener(listener: RuntimeBackgroundListener): void {
+    this.listener = listener
+    for (const runtime of this.runtimes.values()) runtime.setBackgroundListener?.(listener)
+  }
+
+  // A background task outlives the turn that started it, so the runtime that
+  // owns it is no longer recorded as the thread's active one; ask them all.
+  async stopTask(threadId: string, taskId: string): Promise<boolean> {
+    for (const runtime of this.runtimes.values()) {
+      if (await runtime.stopTask?.(threadId, taskId)) return true
+    }
+    return false
+  }
+
+  liveTasks(threadId: string): RuntimeLiveTask[] {
+    return [...this.runtimes.values()].flatMap((runtime) => runtime.liveTasks?.(threadId) ?? [])
+  }
+
+  hasBackgroundWork(): boolean {
+    return [...this.runtimes.values()].some((runtime) => runtime.hasBackgroundWork?.() === true)
+  }
+
+  filtersNestedEvents(threadId: string): boolean {
+    return this.activeRuntimeByThread.get(threadId)?.filtersNestedEvents?.(threadId) === true
+  }
+
+  cliVersion(threadId: string): string | null {
+    const active = this.activeRuntimeByThread.get(threadId)
+    if (active) return active.cliVersion?.(threadId) ?? null
+    for (const runtime of this.runtimes.values()) {
+      const version = runtime.cliVersion?.(threadId)
+      if (version) return version
+    }
+    return null
+  }
+
+  hasPendingContinuation(threadId: string): boolean {
+    return [...this.runtimes.values()].some(
+      (runtime) => runtime.hasPendingContinuation?.(threadId) === true,
+    )
+  }
+
+  resetSession(threadId: string): void {
+    for (const runtime of this.runtimes.values()) runtime.resetSession?.(threadId)
+  }
+
+  // A Claude thread's turns run on the configured backend.
+  compactsSessions(): boolean {
+    return this.runtimeFor(this.config.type).compactsSessions?.() === true
+  }
+
+  // Only a backend that has run a turn has sessions whose servers can retry.
+  async reloadMcpServers(): Promise<void> {
+    await Promise.allSettled(
+      [...this.runtimes.values()].map((runtime) => runtime.reloadMcpServers?.()),
+    )
+  }
+
+  // The first backend whose live session for the thread can say.
+  async mcpServerStatuses(threadId: string): Promise<RuntimeMcpServerStatus[] | null> {
+    for (const runtime of this.runtimes.values()) {
+      const statuses = await runtime.mcpServerStatuses?.(threadId)
+      if (statuses) return statuses
+    }
+    return null
   }
 
   private runtimeFor(type: RuntimeBackendType): ClaudeRuntime {
     const existing = this.runtimes.get(type)
     if (existing) return existing
     const runtime = instantiateRuntime(this.config, type)
+    if (this.listener) runtime.setBackgroundListener?.(this.listener)
     this.runtimes.set(type, runtime)
     return runtime
   }
+}
+
+function runsModelProfiles(type: RuntimeBackendType): boolean {
+  return type === 'agent-sdk-sidecar' || type === 'mock'
+}
+
+function runsAutoReview(type: RuntimeBackendType): boolean {
+  return type === 'agent-sdk-sidecar' || type === 'mock'
 }
 
 function shouldHandleLocally(type: RuntimeBackendType, context: RuntimeTurnContext): boolean {
@@ -168,6 +297,8 @@ function conciseStructuredString(prompt: string): string {
 
 function instantiateRuntime(config: RuntimeConfig, type: RuntimeBackendType): ClaudeRuntime {
   switch (type) {
+    case 'antigravity-acp':
+      return new AntigravityAcpRuntime()
     case 'chrys-acp':
       return new ChrysAcpRuntime()
     case 'mock':

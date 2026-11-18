@@ -304,7 +304,7 @@ export class ChrysAcpRuntime implements ClaudeRuntime {
     }
   }
 
-  async steer(): Promise<void> {
+  async steer(): Promise<undefined> {
     throw new Error('Chrys ACP does not expose turn steering')
   }
 

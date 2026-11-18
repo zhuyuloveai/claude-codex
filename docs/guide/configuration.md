@@ -56,7 +56,9 @@ or session tokens, configure private endpoints, or bypass provider terms.
 ## Models & effort
 
 ```bash
-# Defaults for new threads, surfaced through config/read.
+# Defaults for new threads, surfaced through config/read. The effort is one of
+# low, medium, high, xhigh, max; a model that does not take it defaults to the
+# closest level below.
 export CLAUDE_CODEX_DEFAULT_MODEL="sonnet"
 export CLAUDE_CODEX_DEFAULT_EFFORT="medium"
 
@@ -68,17 +70,341 @@ export CLAUDE_CODEX_MODEL_ALIASES='{"my-long-context":"sonnet[1m]"}'
 export CLAUDE_CODEX_EFFORT_ALIASES='{"xhigh":"max"}'
 ```
 
+Each Claude model in the picker offers the reasoning efforts Claude Code reports
+for it: `max` only on the models that take it, and none on a model without an
+effort setting, such as Haiku. For such a model the App sends the effort
+`none`, and its turns run without one. Claude Code reports the efforts when a
+session starts. The adapter keeps the last report in
+`~/.codex/claude-codex-adapter/claude-models.json`, so the list is right again
+after a restart. The App reloads the list when its window regains focus, at
+most every five minutes, so the levels can take that long to appear after the
+first Claude turn. Before that turn, and with a Claude Code too old to report
+efforts, every model offers low to xhigh. A model in
+`CLAUDE_CODEX_MODELS` is matched to Claude Code's report by the id it passes to
+Claude Code, so an alias for a full model id gets that model's efforts. The
+Codex App hides `max` until it is turned on under Settings > Agent > Model
+features > Available reasoning efforts.
+
+Without model process profiles, the picker also lists the per-model config
+folders a model router keeps under `~/.cache/*/claude-router/`, or in the
+folders `CLAUDE_CONFIG_DIRS` (or `CLAUDE_ROUTER_DIR`) lists. When a chat
+resumes and the newest copy of its session transcript is in another config
+folder, say because it ran on another model, the adapter copies it into the one
+folder this turn's Claude Code runs from: `CLAUDE_CONFIG_DIR`, else
+`~/.claude`, or, with `CLAUDE_CODEX_CLI` set, the router folder named after the
+model when there is one. A copy there that is as new, or longer, is left
+alone: a transcript only grows, so a shorter one is never a later state of it,
+whatever its modification time says. Since a transcript
+holds the whole conversation, the copy keeps the transcript's file mode, and it
+is a clone where the file system supports it.
+
+## Model process profiles
+
+Every Claude thread normally runs the same Claude Code: the one the SDK ships
+(or `CLAUDE_CODEX_CLI`), with the adapter's environment. A profiles file gives
+each model in the picker a Claude Code process of its own instead: its own
+executable, provider environment and Claude config folder
+(`CLAUDE_CONFIG_DIR`, where its sessions live). That way one App can offer
+models from several Claude-compatible providers or accounts you hold. Without a
+profiles file nothing changes.
+
+```bash
+export CLAUDE_CODEX_MODEL_PROFILES_FILE="$HOME/.claude-codex/models.json"
+# Or the same JSON inline; set only one of the two.
+# export CLAUDE_CODEX_MODEL_PROFILES='[{"id":"sonnet"},{"id":"opus"}]'
+```
+
+```json
+{
+  "defaultModel": "main-model",
+  "models": [
+    {
+      "id": "main-model",
+      "sdkModel": "sonnet",
+      "displayName": "Main model",
+      "env": { "CLAUDE_CONFIG_DIR": "${HOME}/.claude-codex/profiles/main-model" }
+    },
+    {
+      "id": "second-model",
+      "sdkModel": "vendor/model-1",
+      "displayName": "Second model",
+      "description": "Served by a second provider",
+      "executable": "${HOME}/bin/claude",
+      "envFile": "second-model.env",
+      "env": {
+        "CLAUDE_CONFIG_DIR": "${HOME}/.claude-codex/profiles/second-model",
+        "ANTHROPIC_AUTH_TOKEN": "${SECOND_PROVIDER_TOKEN}"
+      }
+    }
+  ]
+}
+```
+
+The file holds either an object with a `models` array (and optionally
+`defaultModel`) or just the array. Each profile has:
+
+| Field | Meaning |
+| --- | --- |
+| `id` | The model id the picker shows and threads store. Letters, digits, `.`, `_` and `-` (starting with a letter or digit), at most 128 characters, unique. |
+| `sdkModel` | The model Claude Code runs; defaults to `id`. |
+| `displayName` / `description` | The picker's label and description. |
+| `isDefault` | Marks the default model, as the top-level `defaultModel` does. There is one default: without either, the first profile. |
+| `executable` | Path of the Claude Code to start. Without it the SDK's own Claude Code runs; `CLAUDE_CODEX_CLI` does not apply to profiles. |
+| `envFile` | A file of `KEY=value` lines (`export` and quotes allowed, `#` comments) applied to the process environment. |
+| `env` | Variables set on the process after the env file. |
+| `inheritEnv` | Adapter variables the process inherits. By default `HOME`, `PATH`, `SHELL`, `USER`, `LOGNAME`, the locale, terminal, color and temp-folder variables, the `XDG_*` folders, `SSH_AUTH_SOCK` and `GIT_CONFIG_GLOBAL` / `GIT_CONFIG_SYSTEM`; `["*"]` inherits all of them and cannot be combined with names. |
+
+`${VAR}` in `executable`, `envFile`, the env file and `env` reads the adapter's
+environment; a missing variable is an error. `executable` and `envFile` may
+also start with `~/`, and a relative path is taken from the profiles file's
+folder (the adapter's working folder for inline profiles). A key in `env` that looks like a secret (its name contains `TOKEN`,
+`KEY`, `SECRET`, `PASSWORD` or `AUTH`) must be a single `${VAR}` reference, so
+the file itself never holds a credential. A token budget such as
+`CLAUDE_CODE_MAX_OUTPUT_TOKENS` (`TOKENS` at the end of a word) is no secret.
+`${VAR}` in the env file also reads the file's earlier lines, and in `env`
+the whole env file.
+
+The process starts from the inherited variables without the adapter's provider
+settings (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_BASE_URL`,
+`ANTHROPIC_CUSTOM_HEADERS`, `ANTHROPIC_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`,
+the `ANTHROPIC_DEFAULT_*_MODEL` variables, the Bedrock, Vertex and Foundry
+switches, endpoints and keys (`CLAUDE_CODE_USE_BEDROCK` / `_VERTEX` /
+`_FOUNDRY`, `ANTHROPIC_BEDROCK_BASE_URL`, `ANTHROPIC_VERTEX_BASE_URL`,
+`ANTHROPIC_VERTEX_PROJECT_ID`, `ANTHROPIC_FOUNDRY_*`, `AWS_BEARER_TOKEN_BEDROCK`),
+`CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CODE_SUBAGENT_MODEL`,
+`CLAUDE_CODE_EFFORT_LEVEL` and `CLAUDE_CONFIG_DIR`), even with `["*"]`, and
+without the secret variables the profile reads from (with `["*"]`, those any
+profile's `env` reads); then the env file and `env` apply. So each profile
+sets its own provider and config folder, and the adapter's own credentials
+never reach it. A profile without `CLAUDE_CONFIG_DIR` uses Claude Code's
+default folder. Profiles need the native runtime: with another
+`CLAUDE_CODEX_RUNTIME_TYPE`, a profile turn fails rather than run on the
+adapter's own provider.
+
+The profiles file must be a regular file owned by the user running the adapter,
+neither a symbolic link nor writable by group or others. An env file must be a
+regular file owned by that user with mode `0600`, not a symbolic link; the
+adapter opens it without following links and rejects it if it changes while
+being read. A profiles file that breaks these rules, or that cannot be parsed,
+fails the requests that need it with the reason rather than falling back to
+another Claude Code. The reason is one line of at most 300 characters that
+names the file (or `CLAUDE_CODEX_MODEL_PROFILES`) and says what is wrong, such
+as the JSON error and where it is, without quoting the file's text, so a
+credential pasted into it does not end up on screen or in the logs. A model
+change it fails is an invalid request (`-32600`), so the model menu's toast
+shows the reason.
+
+### Fingerprints
+
+A Claude thread pins the fingerprint of its profile when it starts: a SHA-256
+over the profile's `id`, `sdkModel`, `executable` and `envFile` paths, sorted
+`inheritEnv`, and the env file and `env` assignments with `${VAR}` expanded.
+The value of a secret-looking key, and any secret-looking variable a value
+reads, counts as a placeholder: rotating a credential keeps the fingerprint, while
+changing the model, endpoint, executable, config folder or any other setting
+changes it. The fingerprint is kept with the thread in the adapter's state
+database.
+
+- Once a thread has a conversation (a turn ran, or it is a fork), its Claude
+  session lives in that profile's process and config folder. If the profile's
+  fingerprint changed, the profile or the profiles file is gone, or the thread
+  started before profiles were set up, the chat still opens (`thread/resume`,
+  `thread/read`) so it can be read, but nothing starts Claude for it: a turn,
+  fork, compaction, review or model change fails, saying what happened and to
+  start a new chat, instead of resuming the session somewhere else. A queued
+  message or an active goal reports the same error and does not run; the
+  queued message stays queued.
+- A thread with nothing said yet, such as the one the App opens for a new chat
+  before its first message, takes the profile's current configuration and can
+  still move to any profile.
+- A thread with a conversation stays on its profile: the model menu
+  (`thread/settings/update`, `thread/metadata/update`), `turn/start` and
+  `turn/settings/update` refuse another profile, `thread/resume` ignores one, and
+  a fork stays on its parent's profile, the App's ephemeral description fork
+  included. Subagents run in their parent's process and carry its profile.
+  Its sessions resume only from its profile's config folder, and the workflows
+  it starts are looked up there too.
+- Codex model threads have no profile.
+
+### Profiles and the other model settings
+
+The profiles are the whole Claude part of the picker. `CLAUDE_CODEX_MODELS`,
+`CLAUDE_CODEX_MODEL_ALIASES` and discovered router models are not used, and a
+Claude model id that names no profile is an error rather than a fallback. Codex
+models are listed and routed as before. `CLAUDE_CODEX_DEFAULT_MODEL` still picks
+the model of new threads when it names a profile; the `default` alias is the
+default profile. Each profile offers the reasoning efforts Claude Code reports
+for its `sdkModel`.
+
+A chat's title and summary turns run on its own profile. The App's helper
+threads that name a Codex model, with `CLAUDE_CODEX_DISABLE_CODEX_PROXY=1`, run
+on the profile `CLAUDE_CODEX_SUMMARY_MODEL` names (else
+`CLAUDE_CODEX_TITLE_MODEL`, else the default profile); with profiles set, those
+two variables take a profile id.
+
 ## MCP, tools & directories
 
 ```bash
-# Passed to ClaudeAgentOptions (JSON object or path to a JSON file).
+# Passed to ClaudeAgentOptions (JSON object or path to a JSON file), on top of
+# any servers inherited from the Codex and Claude Code configs (with the
+# switches below) and the ones added in the App's settings; it wins a name.
 export CLAUDE_CODEX_MCP_SERVERS='{"github":{"type":"stdio","command":"github-mcp"}}'
+
+# Also start the Codex config's [mcp_servers] in Claude threads (off by default).
+export CLAUDE_CODEX_CODEX_MCP_SERVERS=1
+
+# Run the App's bundled code-review plugin server for its Pull Requests panel
+# (off by default; uses the host's GitHub credentials, such as a gh login).
+export CLAUDE_CODEX_APP_PLUGIN_MCP=1
+
+# With CLAUDE_CODEX_CLAUDE_CONFIG_DIR set, also bring that Claude Code config's
+# MCP servers, subagents and permission rules (each off by default).
+export CLAUDE_CODEX_CLAUDE_MCP_SERVERS=1
+export CLAUDE_CODEX_CLAUDE_AGENTS=1
+export CLAUDE_CODEX_CLAUDE_PERMISSIONS=1
 
 # Pre-approved tools (others still route through Codex approval) + extra dirs.
 export CLAUDE_CODEX_ALLOWED_TOOLS="Read,Glob,Grep"
 export CLAUDE_CODEX_ADD_DIRS="/repo/shared,/repo/docs"
 export CLAUDE_CODEX_ENABLE_FILE_CHECKPOINTING=1
+
+# Use the servers added under the App's Settings > MCP servers in Claude
+# threads (off by default).
+export CLAUDE_CODEX_APP_MCP_SERVERS=1
+
+# Give Claude a tool with the files the chat changed, as a diff, for reviews
+# outside git (off by default; see below).
+export CLAUDE_CODEX_SESSION_CHANGES=1
 ```
+
+A Claude thread's own turns start these MCP servers, each source winning a
+name from the ones before it:
+
+1. the Codex config's `[mcp_servers]`, with `CLAUDE_CODEX_CODEX_MCP_SERVERS=1`;
+2. the Claude Code config's servers, with `CLAUDE_CODEX_CLAUDE_MCP_SERVERS=1`;
+3. the servers added under the App's **Settings > MCP servers**, with
+   `CLAUDE_CODEX_APP_MCP_SERVERS=1`;
+4. `CLAUDE_CODEX_MCP_SERVERS`.
+
+With `CLAUDE_CODEX_APP_MCP_SERVERS=1` the App's MCP settings add, edit, switch
+off and delete servers through the
+adapter, which keeps them in its own `config.json` under `CLAUDE_CODEX_HOME`
+(not in `CODEX_HOME/config.toml`) and reads them as Codex reads an
+`[mcp_servers.<name>]` entry: a `command` with `args`, `env`, `env_vars` and
+`cwd` (relative to `CODEX_HOME`), or a `url` with its headers and
+`bearer_token_env_var`; `enabled = false`, `enabled_tools` and
+`disabled_tools` work as in Codex. A save without a command or URL, or with a
+field of the wrong type, fails and the App shows the error. The servers the App
+itself writes at startup for its Codex threads (`node_repl`, `cua_repl`) are
+never kept. `mcpServerStatus/list` and `config/mcpServer/reload` include the
+App's servers, and title, summary and other internal turns start none of them.
+Without the switch (the default) the page lists none of them, and saving,
+switching or deleting a server there fails with this message under the form:
+
+> MCP servers added in the App are not used for Claude threads unless the
+> adapter runs with CLAUDE_CODEX_APP_MCP_SERVERS=1. You can also add a server
+> to Claude Code's own MCP config (claude mcp add, or a project's .mcp.json).
+
+Servers saved while the switch was on stay saved, unused, until it is set
+again. The switch is off by default because such a server starts a program,
+or reaches a URL with the headers and environment it names, from every Claude
+thread's turns.
+
+With `CLAUDE_CODEX_SESSION_CHANGES=1` a Claude thread's turns get the
+`codex_session` server's read-only `changes` tool
+(`mcp__codex_session__changes`), which Claude calls without asking. It reads
+the chat's Claude Code transcripts, its subagents' included, and shows each
+file the chat changed with Edit, Write or NotebookEdit as it is now against
+the file before the chat's first change to it, as a unified diff: what
+`/simplify`, `/review` and other reviews would read from `git diff`. It
+follows the thread's history, so a turn rolled back from the thread no longer
+counts. Its arguments narrow it:
+
+- `paths`: only these files or directories, relative to the working directory
+  or absolute (files outside it are only listed otherwise);
+- `turns`: only the changes of the last N turns, the current one included;
+- `stat`: the changed files with their line counts, without the diff.
+
+Outside a git work tree the system prompt tells Claude to call it where a
+command reads its changes from git. What shell commands changed is not in the
+transcripts and not shown, and a subagent's change to a file whose earlier
+text cannot be worked out is shown on its own. The switch is off by default
+because it adds a tool and, outside git, a system prompt line to every Claude
+thread's turns.
+
+## App settings
+
+The App's settings pages write with `config/value/write` and
+`config/batchWrite`. The adapter keeps what they write in its own `config.json`
+and reports it back with `config/read`, except for settings Claude threads have
+no counterpart for: a write that sets one of those fails, and the App shows
+"Couldn't update this setting" next to it.
+
+| Setting | Written by | For Claude threads |
+| --- | --- | --- |
+| `model`, `model_reasoning_effort` | the App | the model and effort of new threads |
+| `approval_policy`, `sandbox_mode` | Settings > Configuration | kept and read back; the App sends them with each new thread, where they set how Claude asks for permission |
+| `web_search` | Settings > Configuration | `disabled` takes Claude's WebSearch tool away; `cached`, `indexed` and `live` keep it, as Claude has the one kind of search. Unset, it is `disabled` with `CLAUDE_CODEX_WEBSEARCH=0` and `live` otherwise. On the `agent-http` and `agentapi` backends Claude keeps the tool whatever it says (see [Backends](/guide/backends)) |
+| `model_reasoning_summary` | Settings > Configuration | `none` hides Claude's thinking |
+| `sandbox_workspace_write.network_access` | Settings > Configuration | always on: Claude threads have no network sandbox, so turning it off fails. `config/read` still reports `sandbox_workspace_write` unset, as Codex does without the table, so Settings shows network access off: with it on, the App would take the default permissions for Custom (config.toml) instead of its Default permissions preset |
+| other `sandbox_workspace_write` fields | none | fixed: Claude threads have no filesystem sandbox, so other values fail |
+| `model_verbosity` | Settings > Configuration | fails: Claude models have no verbosity setting; read back as unset |
+| `service_tier`, `profiles.<name>.service_tier` | the speed menu | `default` succeeds and is not kept; any other tier fails, as Claude models list none |
+| `instructions`, `developer_instructions`, `compact_prompt` | none | fail: Claude threads take instructions from `AGENTS.md` and `CLAUDE.md`, and Claude Code compacts with its own prompt |
+| `mcp_servers.<name>` | Settings > MCP servers | started in Claude threads (see above); `node_repl` and `cua_repl` are not kept |
+| `features.memories`, `memories.*` | Settings > Personalization | Claude Code's auto-memory, with `CLAUDE_CODEX_MEMORIES=1` (see [Memories](/guide/gui#memories)) |
+| `model_auto_compact_token_limit` | none | Claude Code's auto-compact window (see [Context compaction](#context-compaction)) |
+| `provider_loop_provider`, `provider_loop_agent_loop` | none | the provider and agent loop of new threads (see [Provider and agent-loop selection](#provider-and-agent-loop-selection)) |
+| anything else (`desktop.*`, `plugins.*`, `projects.*`, `features.*`, …) | the App | kept and read back for the App; no effect on Claude |
+
+Clearing a setting (writing `null`) always succeeds, and a batch with an edit
+that fails changes nothing. Values the adapter kept before it checked them
+(flat `mcp_servers.*` keys, and values of the settings that now fail) are
+removed the next time it starts.
+
+## Context compaction
+
+```toml
+# CODEX_HOME/config.toml, read for Claude threads only with
+# CLAUDE_CODEX_CODEX_AUTO_COMPACT=1: Claude threads compact their conversation
+# at about this many tokens.
+model_auto_compact_token_limit = 300000
+```
+
+Claude threads take Codex's `model_auto_compact_token_limit` from the first of
+these that sets it:
+
+1. the `config` a thread is started, resumed or forked with (kept until the
+   adapter restarts, as Codex keeps it; a fork also takes its parent's);
+2. what a client wrote with `config/value/write` or `config/batchWrite`;
+3. with `CLAUDE_CODEX_CODEX_AUTO_COMPACT=1`, the Codex config files:
+   `CODEX_HOME/config.toml`, then the `.codex/config.toml` files of a project
+   Codex trusts, from the repository root down to the thread's folder.
+
+The files are off by default: you set the key there for Codex models, where
+it is a token count Codex caps at 90% of the model's context window, and it
+would otherwise replace the window of your Claude Code settings on every
+Claude thread.
+
+The limit becomes Claude Code's auto-compact window: the CLI starts with
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW` set to it, kept within the 100,000 to
+1,000,000 tokens Claude Code takes. The CLI compacts a little before the
+window fills, as Codex compacts once the limit is reached, and caps the window
+at the model's context window, so a larger value compacts once the context is
+nearly full. The window wins over `autoCompactWindow` in Claude Code's own
+settings, a window saved with `/autocompact`, and a
+`CLAUDE_CODE_AUTO_COMPACT_WINDOW` the adapter was started with. A thread
+whose window changes starts a new Claude session on its next
+turn and resumes the conversation in it. Without the key, nothing is set and
+Claude Code keeps its own window. `config/read` reports the window in effect
+for its `cwd`, or `null`. Values that are not a whole number of tokens count as
+unset; `model_auto_compact_token_limit_scope` and `[profiles]` are not read.
+Codex model threads keep Codex's own handling.
+
+A Claude Code subagent brought in with `CLAUDE_CODEX_CLAUDE_AGENTS=1` keeps its
+`autoCompactWindow` frontmatter, which can only lower the window it runs with.
+Claude Code's idle compaction (`idleCompaction` in its settings) is left as
+Claude Code has it.
 
 ## Worktree isolation
 
@@ -96,9 +422,105 @@ When enabled, each new Codex thread runs in a dedicated `git worktree`.
 # Idle shutdown grace period in ms (default 15000; 0 = never exit).
 export CLAUDE_CODEX_IDLE_EXIT_MS="15000"
 
+# Unix socket of `app-server --listen unix://` and `app-server proxy`
+# (default $CODEX_HOME/app-server-control/app-server-control.sock). Set it
+# where both commands run, such as the login shell profile or runtime.env,
+# and give it a folder of its own: the daemon makes that folder private.
+export CLAUDE_CODEX_SOCKET_PATH="$HOME/.claude-codex/run/app-server.sock"
+
+# Start Claude Code processes one at a time (off by default): each waits for
+# the previous one's first message, or at most the timeout in ms (default 30000).
+export CLAUDE_CODEX_SDK_LAUNCH_GATE="1"
+export CLAUDE_CODEX_SDK_LAUNCH_GATE_TIMEOUT_MS="30000"
+
+# Keep the Mac from idle-sleeping while a turn or background work runs (macOS,
+# off by default); closing the lid still sleeps.
+export CLAUDE_CODEX_PREVENT_IDLE_SLEEP="1"
+
 # Pin a node binary for the shim (e.g. when default node is < 24).
 export CLAUDE_CODEX_NODE="/absolute/path/to/node"
 ```
+
+## WebSocket listener
+
+`--listen ws://host:port` serves the protocol over TCP for clients such as
+`codex --remote`. The Codex App does not use it (it runs the adapter over stdio,
+or over the unix socket behind `app-server proxy`, which file permissions
+protect), so these settings only matter for other clients.
+
+```bash
+# Require a capability token on every connection. Without a token source
+# the adapter creates one in ws-token under the adapter home
+# ($CODEX_HOME/claude-codex-adapter unless CLAUDE_CODEX_HOME is set), mode
+# 0600, and prints the file path, never the token.
+export CLAUDE_CODEX_WS_AUTH="capability-token"
+
+# Token sources (set at most one; any of them turns the token on):
+export CLAUDE_CODEX_WS_TOKEN="<at-least-16-printable-characters>"
+export CLAUDE_CODEX_WS_TOKEN_FILE="/absolute/path/to/token"   # mode 0600
+export CLAUDE_CODEX_WS_TOKEN_SHA256="<hex sha-256 of the token>"
+
+# Origins allowed to connect. Requests with any other Origin header are
+# refused, which keeps web pages away from a loopback listener.
+export CLAUDE_CODEX_WS_ALLOWED_ORIGINS="https://example.com"
+
+# Not recommended: let a listener on a non-loopback address start without a
+# token. Anyone who can reach the address can then run the agent as this user.
+export CLAUDE_CODEX_WS_ALLOW_UNAUTHENTICATED=1
+```
+
+The same settings exist as flags: `--ws-auth capability-token|none`,
+`--ws-token-file`, `--ws-token-sha256`, `--ws-allowed-origins` and
+`--ws-allow-unauthenticated`.
+
+- A client sends the token as `Authorization: Bearer <token>`, which is what
+  `codex --remote ws://… --remote-auth-token-env VAR` does. A browser, which
+  cannot set headers on a WebSocket, offers the subprotocols
+  `claude-codex.v1` and `claude-codex.bearer.<token>`; the adapter answers with
+  `claude-codex.v1` only.
+- On a loopback address (`127.0.0.1`, `::1`, `localhost`) the token is
+  optional unless one of the settings above turns it on, so existing local
+  clients keep working. On any other address (`0.0.0.0`, `::`, a LAN or public
+  IP) the adapter refuses to start without it, as `codex app-server` does:
+
+  ```text
+  refusing to start non-loopback websocket listener ws://0.0.0.0:8788 without auth. Pass --ws-auth capability-token (CLAUDE_CODEX_WS_AUTH=capability-token) to require a token, or --ws-allow-unauthenticated (CLAUDE_CODEX_WS_ALLOW_UNAUTHENTICATED=1) to accept any client that can reach this address.
+  ```
+
+  `--ws-allow-unauthenticated` is the explicit opt-out for a listener that
+  something else protects (a private network, a firewall, an authenticating
+  reverse proxy). The adapter then prints a warning at startup, and the
+  `Origin` check below still applies. It cannot be combined with a token.
+- Any request with an `Origin` header is refused (403) unless the origin is in
+  `CLAUDE_CODEX_WS_ALLOWED_ORIGINS`. App-server clients outside a browser send
+  no Origin.
+- Tokens are compared as SHA-256 digests in constant time and never logged.
+- `ws://` is plain text. Off the local machine, put it behind TLS (a reverse
+  proxy) or reach it through an SSH tunnel to a loopback listener. The Codex
+  CLI sends a `--remote-auth-token-env` token only to a `wss://` or a loopback
+  `ws://` URL.
+- `ws://[::1]:8788` listens on the IPv6 loopback address, and port `0` picks a
+  free port; the `listening on ws://…` line shows the port actually bound.
+
+## Claude Code variables
+
+The Claude Code process of a Claude thread inherits the adapter's environment,
+with the few variables the adapter sets for its own features on top, so a Claude
+Code variable set where the adapter starts (the login shell, or
+`~/.claude-codex/runtime.env` for the shim) reaches Claude Code as it would in a
+terminal. The adapter has no settings of its own for these.
+
+Fork subagents are one example. Since Claude Code 2.1.302, Agent SDK sessions
+can start an agent with `subagent_type: "fork"`, which inherits the whole
+conversation and runs on its parent's model, effort and permission mode. The
+Codex App shows it as a subagent whose role is `fork`, and its spawn card shows
+the parent's model and effort. `CLAUDE_CODE_FORK_SUBAGENT=0` in the adapter's
+environment turns forks off; unset, Claude Code's default applies.
+
+With [model process profiles](#model-process-profiles), a profile's process
+inherits only the variables its `inheritEnv` names. Add
+`CLAUDE_CODE_FORK_SUBAGENT` (or another Claude Code variable) there, or set it in
+the profile's `env` or env file.
 
 ## Reference table
 
@@ -106,7 +528,7 @@ export CLAUDE_CODEX_NODE="/absolute/path/to/node"
 | --- | --- |
 | `CLAUDE_CODEX_ADAPTER` | Path to `dist/src/adapter.mjs` (used by the shim). |
 | `CLAUDE_CODEX_NODE` | Node binary the shim launches. |
-| `CLAUDE_CODEX_COMPAT_VERSION` | Codex app-server version advertised (default `0.142.3`). |
+| `CLAUDE_CODEX_COMPAT_VERSION` | Codex app-server version advertised (default `0.163.0-alpha.10.2`, the Codex build of App 26.1013). The App turns features on by it; see [Codex App compatibility](/reference/app-compat#feature-gates-and-claude-codex-compat-version). |
 | `CLAUDE_CODEX_VERSION_SUFFIX` | Tag after the version to distinguish the adapter from real codex (default `claude-codex`; set `""` to behave exactly like upstream codex). |
 | `CODEX_REAL` | Real Codex CLI for non-app-server commands / `codex` passthrough. |
 | `CLAUDE_CODEX_RUNTIME_TYPE` | Active backend route. |
@@ -114,14 +536,57 @@ export CLAUDE_CODEX_NODE="/absolute/path/to/node"
 | `CLAUDE_CODEX_AGENT_LOOP` | Agent-loop id (`native-claude-code-sdk` or `codex-jsonl-proxy`) mapped only to existing runtime behavior. |
 | `provider_loop_provider` | Saved config key for provider descriptor selection via `config/value/write`. |
 | `provider_loop_agent_loop` | Saved config key for agent-loop selection via `config/value/write`. |
+| `model_auto_compact_token_limit` | Codex config key (thread `config`, `config/value/write`, and with `CLAUDE_CODEX_CODEX_AUTO_COMPACT=1` user or trusted project `config.toml`): the token count Claude threads compact at, as Claude Code's auto-compact window (100,000 to 1,000,000). Unset leaves Claude Code's own window. See [Context compaction](#context-compaction). |
 | `CLAUDE_CODEX_DEFAULT_MODEL` / `_EFFORT` | Defaults for new threads. |
-| `CLAUDE_CODEX_MODELS` | Codex App model picker list. |
-| `CLAUDE_CODEX_MODEL_ALIASES` / `_EFFORT_ALIASES` | Id remapping. |
-| `CLAUDE_CODEX_MCP_SERVERS` | MCP server config (JSON or file path). |
+| `CLAUDE_CODEX_MODELS` | Codex App model picker list. Unused with model process profiles. |
+| `CLAUDE_CODEX_MODEL_PROFILES_FILE` | JSON file of model process profiles: each Claude model in the picker runs its own Claude Code executable, provider environment and config folder, and a thread stays on the profile it started with. Must be owned by the user and not writable by others. See [Model process profiles](#model-process-profiles). |
+| `CLAUDE_CODEX_MODEL_PROFILES` | The same profiles as inline JSON; set only one of the two. |
+| `CLAUDE_CODEX_CODEX_MODELS` | Codex models the picker offers through the bundled `codex` (comma-separated). Without it the list comes from `model_catalog.json` in `CODEX_HOME`. |
+| `CLAUDE_CODEX_DISABLE_CODEX_PROXY` | `1` turns Codex model routing off, unless the Codex proxy is the selected loop: the picker offers only Claude models, a new thread on a Codex model is refused, and the App's title and summary threads run on `CLAUDE_CODEX_SUMMARY_MODEL` (else `CLAUDE_CODEX_TITLE_MODEL`, else haiku; with model process profiles, the profile they name, else the default profile). |
+| `CLAUDE_CODEX_MODEL_ALIASES` / `_EFFORT_ALIASES` | Id remapping (model aliases are unused with model process profiles). |
+| `CLAUDE_CODEX_MCP_SERVERS` | MCP server config (JSON or path to a JSON file; a file may wrap the servers in `mcpServers` as `.mcp.json` does). Wins a name over inherited servers and the ones added in the App's settings. |
+| `CLAUDE_CODEX_CODEX_MCP_SERVERS` | `1` starts the Codex config's `[mcp_servers]` (user `config.toml` and trusted project `.codex/config.toml`) in Claude threads; off otherwise, since the Codex App writes its own desktop servers into that file. See [Inherited configuration](https://github.com/fuergaosi233/claude-codex#inherited-configuration). |
+| `CLAUDE_CODEX_CODEX_NOTIFY` | `1` runs the Codex config's `notify` program when a Claude thread's turn completes; off otherwise, since the Codex App sets `notify` to its own turn-ended program. See [Inherited configuration](https://github.com/fuergaosi233/claude-codex#inherited-configuration). |
+| `CLAUDE_CODEX_CODEX_AUTO_COMPACT` | `1` takes `model_auto_compact_token_limit` from the Codex config files (user `config.toml` and trusted project `.codex/config.toml`) as the auto-compact window of Claude threads; off otherwise, since users set it there for Codex models and it would replace their Claude Code window. See [Context compaction](#context-compaction). |
+| `CLAUDE_CODEX_APP_PLUGIN_MCP` | `1` runs the MCP server of the Codex App's bundled `code-review` plugin for the App's Pull Requests panel calls, from the plugin's folder with a short environment allowlist; a comma-separated list names other plugins instead (`codex-app-tools` and `browser-use` never run). Off otherwise; Claude threads never get these servers. The plugin uses the host's GitHub credentials, such as an existing `gh` login; the adapter passes it no token. See [Pull Requests panel](/guide/gui#pull-requests-panel). |
+| `CLAUDE_CODEX_APP_MCP_SERVERS` | `1` lets the App's Settings > MCP servers add, edit, switch off and delete servers, which the adapter keeps in its own config and starts in Claude threads' own turns, below `CLAUDE_CODEX_MCP_SERVERS`. Off otherwise (the default): the page lists no server and every save, switch or delete there fails with a message naming this switch and Claude Code's own MCP config; servers saved earlier stay saved, unused. See [MCP, tools & directories](#mcp-tools-directories). |
 | `CLAUDE_CODEX_ALLOWED_TOOLS` | Pre-approved tools. |
 | `CLAUDE_CODEX_ADD_DIRS` | Extra directories exposed to Claude. |
+| `CLAUDE_CODEX_CLAUDE_CONFIG_DIR` | Claude Code config folder (such as `~/.claude`) whose `CLAUDE.md`, rules and skills the adapter passes to Claude itself, together with the project's `CLAUDE.md` files, rules and skills. For a Claude CLI started with its setting sources turned off. `AGENTS.md` files reach Claude either way. Its MCP servers, subagents, permission rules and command hooks come along only with the switches below. |
+| `CLAUDE_CODEX_CLAUDE_MCP_SERVERS` | `1` starts the bridged Claude Code config's MCP servers (with approved project `.mcp.json` servers) in Claude threads and lists them in the App's MCP panel; off otherwise. Needs `CLAUDE_CODEX_CLAUDE_CONFIG_DIR`. See [Inherited configuration](https://github.com/fuergaosi233/claude-codex#inherited-configuration). |
+| `CLAUDE_CODEX_CLAUDE_AGENTS` | `1` gives Claude threads the bridged config's and the project's Claude Code subagents; off otherwise. Needs `CLAUDE_CODEX_CLAUDE_CONFIG_DIR`. |
+| `CLAUDE_CODEX_CLAUDE_PERMISSIONS` | `1` applies the bridged config's and the project's Claude Code permission allow, ask and deny rules (ask rules through a `PreToolUse` callback that sends the calls they cover to the Codex approval); off otherwise. Needs `CLAUDE_CODEX_CLAUDE_CONFIG_DIR`. |
+| `CLAUDE_CODEX_CLAUDE_HOOKS` | Which Claude Code command hooks run with `CLAUDE_CODEX_CLAUDE_CONFIG_DIR` set: the config folder's `settings.json` with `user`, also a trusted project's `.claude/settings.json` and `.claude/settings.local.json` with `project`, none when unset, `0` or anything else (often terminal status or notification integrations, so they stay off for App chats unless asked for). The Claude CLI must start without its setting sources, or it runs the same hooks too; the adapter warns at startup. A hook's `onFailure: "block"` is honored: one that cannot start, times out, exits with a code other than 0 or 2 or prints JSON that does not parse blocks as exit 2 would. See [Inherited configuration](https://github.com/fuergaosi233/claude-codex#inherited-configuration). |
+| `CLAUDE_CODEX_SESSION_SUGGESTIONS` | `1` has the App's "Allow for this session" also add the rules and folders Claude Code offers for the session with the call, such as every fetch from the same domain or the folder outside the workspace; off otherwise, so a session approval covers no more than in a Codex chat. See [Approvals](/guide/gui#approvals). |
 | `CLAUDE_CODEX_ENABLE_FILE_CHECKPOINTING` | Enable SDK file checkpointing. |
 | `CLAUDE_CODEX_AUTO_WORKTREE` / `_WORKTREE_ROOT` | Per-thread worktree isolation. |
 | `CLAUDE_CODEX_IDLE_EXIT_MS` | Daemon idle shutdown. |
+| `CLAUDE_CODEX_PREVENT_IDLE_SLEEP` | `1` keeps a Mac from idle-sleeping while Claude works: the adapter holds `/usr/bin/caffeinate -i -w <adapter pid>` while any turn, background agent or other background work runs, and stops it once nothing does. Background work includes a command Claude runs in the background with Bash: a dev server or file watcher keeps the Mac awake until its Claude session closes, which happens `CLAUDE_CODEX_BACKGROUND_IDLE_MS` (default 2 hours) after the session's last message. A computer that sleeps during a turn breaks Claude's connection to the model and fails the turn. Closing the lid still sleeps, and the `caffeinate` process ends with the adapter. A `caffeinate` that cannot start or ends on its own is started again while work runs, and never fails a turn; the adapter stops trying until it restarts only after three in a row end within a minute of starting. Off by default; does nothing on other platforms. See [Retries and errors](/guide/gui#retries-and-errors). |
+| `CLAUDE_CODEX_WS_AUTH` | `capability-token` requires a token on the `ws://` listener; `none` (the default on loopback) does not. See [WebSocket listener](#websocket-listener). |
+| `CLAUDE_CODEX_WS_TOKEN` / `_TOKEN_FILE` / `_TOKEN_SHA256` | The `ws://` listener token, from the variable, a 0600 file (absolute path), or as its SHA-256 digest. Default: `ws-token` in the adapter home, created on first use. |
+| `CLAUDE_CODEX_WS_ALLOWED_ORIGINS` | Comma-separated origins allowed to open a `ws://` connection; requests with any other `Origin` are refused. |
+| `CLAUDE_CODEX_WS_ALLOW_UNAUTHENTICATED` | `1` (or `--ws-allow-unauthenticated`) lets a `ws://` listener on a non-loopback address start without a token, which it otherwise refuses. Not recommended: anyone who can reach the address can run the agent. |
+| `CLAUDE_CODEX_SOCKET_PATH` | Unix socket that `app-server --listen unix://` listens on and `app-server proxy` connects to when neither names one (`app-server proxy --sock <path>` still wins). Default `app-server-control/app-server-control.sock` under `CODEX_HOME`, or a short path in the temp directory when that is too long for a socket. Both commands read it, so set it where both run, as an absolute path (a relative one resolves against each command's working directory) within the socket path limit (about 104 bytes on macOS, 108 on Linux). The daemon creates the socket's folder if needed and makes it private to the user (mode 700), with a `.pid` file next to the socket, so give the socket a folder of its own. |
+| `CLAUDE_CODEX_BACKGROUND_IDLE_MS` | How long a Claude session keeps background agents and background Bash commands alive without any message (default 2 hours). Every message, a background agent's progress included, starts the wait over. |
+| `CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS` | How long a turn waits on a subagent or workflow that shows no sign of life before it fails the turn (default `1800000`, 30 minutes; `0` never gives up; at least `100`). Any progress (the agent's output or tool heartbeats, task progress, a workflow agent starting or finishing) starts the wait over. The wait is paused while the turn waits on you (an approval, a question, an MCP elicitation or an App tool call), and time the computer spends asleep does not count: after either, the wait starts over. On expiry the turn is stopped as an interrupt would stop it, which keeps background work earlier turns left running; while background agents the turn itself handed off still run, only its own stuck agents and workflows stop and those agents keep going. |
+| `CLAUDE_CODEX_SUBAGENT_ITEMS` | `0` keeps a subagent's thread to its prompt and its answer. By default (Agent SDK backend) the thread also shows the subagent's own work as it goes: its messages, thinking, and tool calls with their results, as the items the chat shows for its own calls, stored with the thread; the parent chat looks the same either way. See [Subagents](/guide/gui#subagents). |
+| `CLAUDE_CODEX_QUIET_BACKGROUND_TURNS` | `0` marks every finished turn unread in the Codex App again. By default a turn that ends while its background agents or workflows still run leaves the chat read and sends no notification (background Bash shells do not count, since one can run for hours); see [Background work and the unread dot](/guide/gui#background-work-and-the-unread-dot). |
+| `CLAUDE_CODEX_NOTICE_ROWS` | `0` sends Claude Code's notices (a compaction it could not do, a switch to a fallback model, a call refused while no turn ran) as `warning` notifications alone, which the Codex App does not show. By default each also shows as a row under its turn; see [Retries and errors](/guide/gui#retries-and-errors). |
+| `CLAUDE_CODEX_LIVE_FILE_CHANGES` | `0` shows a file change only once Claude has written the whole call. By default the card of an Edit, Write or MultiEdit call opens as soon as Claude's streamed input names the file and grows while Claude writes the rest, as the Codex App draws a patch Codex is still writing; see [File changes while Claude writes them](/guide/gui#file-changes-while-claude-writes-them). |
+| `CLAUDE_CODEX_COMMAND_OUTPUT_POLL_MS` | How often a running Bash command's output is read for its command item in the App (default `1000`); `0` shows the output only once the command finishes. A session whose Claude Code reports a version before 2.1.287 cannot answer the reads and shows the output when the command finishes. |
+| `CLAUDE_CODEX_MCP_TIMEOUT_MS` | How long the adapter waits on an MCP server it reaches itself, for `mcpServerStatus/list` and the App's `mcpServer/tool/call` and `mcpServer/resource/read`, before it gives up and ends a stdio server (default `20000`, for the whole connection). |
+| `CLAUDE_CODEX_SESSION_SETTLE_MS` | How long an idle session waits for Claude to answer a task that just ended, when the CLI does not report session state (default `15000`). |
+| `CLAUDE_CODEX_SDK_LAUNCH_GATE` | `1` starts the Claude Code processes of Claude threads one at a time: each waits until the one before has sent its first message. Several starting at the same moment, such as the chats that all resume their Claude sessions right after a restart, write the user's `~/.claude.json` at once and can corrupt it ([anthropics/claude-code#28847](https://github.com/anthropics/claude-code/issues/28847)). Prompts and steers sent meanwhile wait for their process. Off by default. |
+| `CLAUDE_CODEX_SDK_LAUNCH_GATE_TIMEOUT_MS` | With `CLAUDE_CODEX_SDK_LAUNCH_GATE=1`, how long a launch that has said nothing yet holds the next one back (default `30000`). A SessionStart hook that Claude Code runs as it starts does not count: Claude Code reports the hook when it begins, which lets the next launch go ahead. |
+| `CLAUDE_CODEX_GOAL_TOOLS` | `0` keeps the goal tools (the `codex_goal` MCP server) away from Claude. |
+| `CLAUDE_CODEX_MEMORIES` | `1` lets the App's Memories settings and `/memories` decide whether Claude threads run with Claude Code's auto-memory; with Memories off in the App, Claude threads then run without it. Off otherwise: the App shows no Memories settings and Claude Code's own settings decide. See [Memories](/guide/gui#memories). |
+| `CLAUDE_CODEX_DYNAMIC_TOOLS` | `1` offers Claude the dynamic tools a client registers on `thread/start`, such as the Codex App's own tools on a remote connection, each namespace as an MCP server; Claude's calls go back to the client as `item/tool/call` without an approval prompt. Off by default, because the App's tools act on your desktop. Applies to chats started while it is on. See [App tools](/guide/gui#app-tools). |
+| `CLAUDE_CODEX_LEADER_TOOLS` | `1` gives Claude in chats you start the leader tools (the `codex_leader` MCP server), to start and drive other chats; off by default. See [Leader chats](/guide/gui#leader-chats). |
+| `CLAUDE_CODEX_LEADER_MAX_RUNNING` | How many chats one leader may have working at once (default `4`). |
+| `CLAUDE_CODEX_REASONING_VISIBLE` | `0` keeps Claude's thinking out of the Codex App: the CLI is not passed `--thinking-display summarized`, and what thinking arrives stays raw reasoning content, which the App does not show. The App's Reasoning summary setting set to None (`model_reasoning_summary = "none"`) does the same. Use it too with a Claude CLI pinned through `CLAUDE_CODEX_CLI` that predates the flag. See [Thinking and reasoning summaries](/guide/gui#thinking-and-reasoning-summaries). |
+| `CLAUDE_CODEX_WEBSEARCH` | `0` turns web search off for Claude threads while the App's Settings > Configuration saved no Web search mode: Claude's turns run without Claude Code's WebSearch tool, `config/read` reports `web_search = "disabled"` and `modelProvider/capabilities/read` reports no web search. A mode saved there wins, so `cached`, `indexed` or `live` gives Claude the tool back. Otherwise Claude has the tool and both report live search, the way it works. Claude Code's permission rules can also deny it. The `agent-http` and `agentapi` backends run Claude outside the adapter, so Claude keeps the tool there either way (see [Backends](/guide/backends)). |
+| `CLAUDE_CODEX_REAP_ORPHANED_CLI` | `0` stops the adapter from ending Claude CLI processes a previous adapter left running (on by default; never on Windows). |
 | `CLAUDE_CODEX_MOCK` | Run the protocol without Claude credentials. |
+| `CLAUDE_CODEX_STATE_DB_TIMEOUT_MS` | How long a state-database write waits for another connection's lock before it fails (default `5000`). |
 | `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` | Claude auth / custom endpoint configuration. Keep real values out of git. |
+| `CLAUDE_CODE_FORK_SUBAGENT` | Claude Code's own switch, passed on from the adapter's environment: `0` keeps Claude from starting fork subagents (`subagent_type: "fork"`), which Claude Code 2.1.302 and later offer by default. With model process profiles, only a profile that inherits or sets it passes it on. See [Claude Code variables](#claude-code-variables). |

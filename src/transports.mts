@@ -1,10 +1,18 @@
-import { existsSync, rmSync } from 'node:fs'
+import { existsSync, lstatSync, rmSync } from 'node:fs'
 import http from 'node:http'
 import net from 'node:net'
 import readline from 'node:readline'
 import { WebSocket, WebSocketServer } from 'ws'
 import type { RpcPeer, WireMessage } from './types.mjs'
 import { defaultSocketPath, ensureParent, newId, sleep } from './util.mjs'
+import {
+  authNotice,
+  rejectUpgrade,
+  resolveWebSocketAuth,
+  selectProtocol,
+  type WebSocketAuth,
+  type WebSocketAuthOptions,
+} from './ws-auth.mjs'
 
 export type MessageHandler = (peer: RpcPeer, message: WireMessage) => void | Promise<void>
 export type CloseHandler = (peer: RpcPeer) => void
@@ -60,6 +68,17 @@ export interface RunningTransport {
   close(): Promise<void>
 }
 
+export interface WebSocketTransportOptions {
+  // Applies to ws:// listeners; a unix socket is protected by its directory.
+  // Resolved from the environment when absent.
+  auth?: WebSocketAuth
+}
+
+export interface RunningWebSocketTransport extends RunningTransport {
+  // ws://host:port with the bound port, or the socket path.
+  readonly address: string
+}
+
 export function startStdioTransport(
   onMessage: MessageHandler,
   onClose: CloseHandler,
@@ -92,10 +111,23 @@ export async function startWebSocketTransport(
   onMessage: MessageHandler,
   onClose: CloseHandler,
   onConnect?: CloseHandler,
-): Promise<RunningTransport> {
+  options: WebSocketTransportOptions = {},
+): Promise<RunningWebSocketTransport> {
   const parsed = parseListenUrl(listenUrl)
+  // Resolved before binding, so a listener that would be unprotected never
+  // opens its port.
+  const auth =
+    parsed.kind === 'ws' ? (options.auth ?? resolveWebSocketAuth(parsed.host, parsed.port)) : null
   const server = http.createServer()
-  const wss = new WebSocketServer({ server })
+  const wss = new WebSocketServer({ noServer: true, handleProtocols: selectProtocol })
+  server.on('upgrade', (req, socket, head) => {
+    const verdict = auth ? auth.verify(req) : null
+    if (verdict && !verdict.ok) {
+      rejectUpgrade(socket, req, verdict)
+      return
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req))
+  })
 
   wss.on('connection', (ws) => {
     const peer = new WebSocketPeer(ws)
@@ -123,27 +155,59 @@ export async function startWebSocketTransport(
       if (existsSync(parsed.path)) rmSync(parsed.path, { force: true })
       server.listen(parsed.path)
     } else {
-      server.listen(parsed.port, parsed.host)
+      server.listen(parsed.port, unbracketHost(parsed.host))
     }
   })
 
+  // The socket this listener bound, by inode: another process may bind the
+  // same path later, and that socket is not ours to remove.
+  const socketPath = parsed.kind === 'unix' ? parsed.path : null
+  const ownSocket = socketPath ? fileId(socketPath) : null
+  let address: string
   if (parsed.kind === 'unix') {
-    process.stderr.write(`[chrys-codex-adapter] listening on ${parsed.path}\n`)
+    address = parsed.path
   } else {
-    process.stderr.write(`[chrys-codex-adapter] listening on ws://${parsed.host}:${parsed.port}\n`)
+    const bound = server.address()
+    const port = bound && typeof bound === 'object' ? bound.port : parsed.port
+    address = `ws://${parsed.host}:${port}`
+    const notice = auth ? authNotice(auth, parsed.host, address) : null
+    if (notice) process.stderr.write(`[claude-codex-adapter] ${notice}\n`)
   }
+  process.stderr.write(`[claude-codex-adapter] listening on ${address}\n`)
 
   return {
+    address,
     async close() {
+      // Both servers wait for their connections to end before they close.
+      for (const client of wss.clients) client.terminate()
+      const current = socketPath ? fileId(socketPath) : null
+      if (current && current !== ownSocket) {
+        // Closing a unix listener unlinks its path, whatever is there now. The
+        // path holds another socket, so this one stays open, unreachable, until
+        // the process exits.
+        wss.close()
+        server.unref()
+        return
+      }
       await new Promise<void>((resolve) => {
         wss.close(() => {
           server.close(() => resolve())
+          server.closeAllConnections()
         })
       })
-      if (parsed.kind === 'unix' && existsSync(parsed.path)) {
-        rmSync(parsed.path, { force: true })
-      }
+      // Closing unlinked our socket; in case it did not.
+      if (socketPath && fileId(socketPath) === ownSocket) rmSync(socketPath, { force: true })
     },
+  }
+}
+
+// A file's device and inode, or null when nothing is at the path.
+function fileId(path: string): string | null {
+  try {
+    const stat = lstatSync(path)
+    return `${stat.dev}:${stat.ino}`
+  } catch {
+    return null
   }
 }
 
@@ -164,13 +228,13 @@ export async function runProxy(socketPath: string, timeoutMs = 10_000): Promise<
         const swallow = (label: string) => (error: NodeJS.ErrnoException) => {
           if (error.code === 'EPIPE' || error.code === 'ECONNRESET' || error.code === 'EBADF')
             return
-          process.stderr.write(`[chrys-codex-adapter] proxy ${label} error: ${error.message}\n`)
+          process.stderr.write(`[claude-codex-adapter] proxy ${label} error: ${error.message}\n`)
         }
         process.stdin.on('error', swallow('stdin'))
         process.stdout.on('error', swallow('stdout'))
         socket.on('close', () => resolve())
         socket.on('error', (error) => {
-          process.stderr.write(`[chrys-codex-adapter] proxy socket error: ${error.message}\n`)
+          process.stderr.write(`[claude-codex-adapter] proxy socket error: ${error.message}\n`)
           resolve()
         })
       })
@@ -221,4 +285,20 @@ function parseListenUrl(
     }
   }
   throw new Error(`unsupported listen URL: ${listenUrl}`)
+}
+
+// Resolves the auth of a ws:// listener (creating the token file when needed)
+// and throws when the listener would be unprotected; null for other URLs.
+export function prepareWebSocketAuth(
+  listenUrl: string,
+  options: WebSocketAuthOptions,
+): WebSocketAuth | null {
+  if (!listenUrl.startsWith('ws://')) return null
+  const parsed = parseListenUrl(listenUrl)
+  return parsed.kind === 'ws' ? resolveWebSocketAuth(parsed.host, parsed.port, options) : null
+}
+
+// URL keeps IPv6 hosts in brackets; listen() wants the bare address.
+function unbracketHost(host: string): string {
+  return host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host
 }

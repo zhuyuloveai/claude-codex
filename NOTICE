@@ -3,3 +3,6 @@ fuergaosi233/claude-codex, released under the MIT License.
 
 The Chrys ACP runtime, catalog integration, deployment shim, installer, and
 acceptance coverage were added for this project.
+
+The Antigravity ACP runtime, isolated localhost SSH route, macOS LaunchAgent
+installer, and integration coverage were added by this downstream project.

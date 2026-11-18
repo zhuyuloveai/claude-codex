@@ -1,18 +1,33 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+RUNTIME_ENV="${CLAUDE_CODEX_RUNTIME_ENV:-$HOME/.claude-codex/runtime.env}"
+
+if [ -f "$RUNTIME_ENV" ]; then
+  # shellcheck source=/dev/null
+  source "$RUNTIME_ENV"
+fi
+
 ADAPTER="${CHRYS_CODEX_ADAPTER:-${CLAUDE_CODEX_ADAPTER:-$HOME/.local/share/chrys-codex-adapter/dist/src/adapter.mjs}}"
 NODE_BIN="${CHRYS_CODEX_NODE:-${CLAUDE_CODEX_NODE:-node}}"
-COMPAT_VERSION="${CHRYS_CODEX_COMPAT_VERSION:-${CODEX_SHIM_COMPAT_VERSION:-0.142.3}}"
-VERSION_SUFFIX="${CHRYS_CODEX_VERSION_SUFFIX-chrys-codex}"
+# Keep the reported version in sync with codexCompatVersion() in src/util.mts —
+# both default to 0.163.0-alpha.10.2 and honour CLAUDE_CODEX_COMPAT_VERSION.
+COMPAT_VERSION="${CHRYS_CODEX_COMPAT_VERSION:-${CLAUDE_CODEX_COMPAT_VERSION:-${CODEX_SHIM_COMPAT_VERSION:-0.163.0-alpha.10.2}}}"
+# Distinguishing suffix (see codexVersionSuffix() in src/util.mts). The `-`
+# form (not `:-`) means CLAUDE_CODEX_VERSION_SUFFIX="" disables it.
+VERSION_SUFFIX="${CLAUDE_CODEX_VERSION_SUFFIX-claude-codex}"
+MODE="${CLAUDE_CODEX_ROUTE:-${CLAUDE_CODEX_RUNTIME_TYPE:-agent-sdk-sidecar}}"
 
 resolve_real_codex() {
   if [ -n "${CODEX_REAL:-}" ] && [ -x "$CODEX_REAL" ]; then
     printf '%s\n' "$CODEX_REAL"
     return 0
   fi
-  local self candidate
+
+  local self
   self="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")"
+
+  local candidate
   while IFS= read -r candidate; do
     [ -n "$candidate" ] || continue
     [ "$candidate" != "$self" ] || continue
@@ -20,43 +35,99 @@ resolve_real_codex() {
     printf '%s\n' "$candidate"
     return 0
   done < <({ type -P -a codex 2>/dev/null || which -a codex 2>/dev/null; } | awk '!seen[$0]++')
+
   return 1
 }
 
-case "${1:-}" in
-  --version|-V|version)
-    echo "${CODEX_SHIM_VERSION:-codex-cli ${COMPAT_VERSION}${VERSION_SUFFIX:+ (${VERSION_SUFFIX})}}"
-    exit 0
-    ;;
-esac
+is_native_codex_mode() {
+  case "$MODE" in
+    codex|native-codex|real-codex|native|real)
+      return 0
+      ;;
+  esac
+  return 1
+}
 
-# Codex Remote currently launches the daemon as
-# `codex -c features.code_mode_host=true app-server ...`. The adapter does not
-# consume Codex CLI global options, so forward from the app-server token onward.
+# `app-server --print-startup-config [--startup-sign-out]`: the one line codex
+# prints, without starting node. Claude threads have no ChatGPT account to
+# sign out of, and no config requirements. Fails for anything else (a client
+# info to check, a usage error, a version that needs escaping), which the
+# adapter then answers.
+print_startup_config() {
+  shift
+  [ "$#" -gt 0 ] || return 1
+  case "$COMPAT_VERSION" in
+    '' | *[!A-Za-z0-9._+-]*) return 1 ;;
+  esac
+  local requested=0 arg
+  for arg in "$@"; do
+    case "$arg" in
+      --print-startup-config) requested=1 ;;
+      --startup-sign-out) ;;
+      *) return 1 ;;
+    esac
+  done
+  [ "$requested" = 1 ] || return 1
+  printf '{"appServerVersion":"%s","configRequirements":{"requirements":null}}\n' "$COMPAT_VERSION"
+}
+
+# `app-server daemon version` with no daemon socket: report it and fail at
+# once, as codex does, so the Codex App starts its own server. Fails for
+# anything else, and when the socket exists: the adapter then checks that a
+# daemon listens on it.
+no_daemon_running() {
+  [ "$#" = 3 ] && [ "$2" = daemon ] && [ "$3" = version ] || return 1
+  local socket="${CODEX_HOME:-$HOME/.codex}/app-server-control/app-server-control.sock"
+  if [ -n "${CHRYS_CODEX_HOME:-}" ]; then socket="$CHRYS_CODEX_HOME/app-server-control.sock"; fi
+  [ -S "$socket" ] && return 1
+  echo "Error: no app-server daemon is running at $socket" >&2
+}
+
+REAL_CODEX="$(resolve_real_codex || true)"
+
+# Preserve leading global options (including App plugin config) for the adapter.
 args=("$@")
 for ((index = 0; index < ${#args[@]}; index += 1)); do
   if [ "${args[$index]}" = "app-server" ]; then
-    [ -f "$ADAPTER" ] || { echo "Chrys Codex adapter not found: $ADAPTER" >&2; exit 127; }
-    # Codex App's SSH bootstrap expects the unix app-server command to
-    # daemonize after its socket is ready. Keep direct/local invocations in the
-    # foreground so development, tests, and explicit process supervision retain
-    # their normal lifecycle.
+    set -- app-server "${args[@]:0:$index}" "${args[@]:$index+1}"
     if [ -n "${SSH_CONNECTION:-}" ]; then
-      for arg in "${args[@]:$index+1}"; do
+      for arg in "$@"; do
         case "$arg" in
           unix://*|--listen=unix://*) export CHRYS_CODEX_DAEMONIZE=1 ;;
         esac
       done
     fi
-    exec "$NODE_BIN" "$ADAPTER" "${args[@]:$index}"
+    break
   fi
 done
 
-REAL_CODEX="$(resolve_real_codex || true)"
+case "${1:-}" in
+  --version|-V|version)
+    if is_native_codex_mode && [ -n "$REAL_CODEX" ]; then
+      exec "$REAL_CODEX" "$@"
+    fi
+    echo "${CODEX_SHIM_VERSION:-codex-cli ${COMPAT_VERSION}${VERSION_SUFFIX:+ (${VERSION_SUFFIX})}}"
+    exit 0
+    ;;
+  app-server)
+    if is_native_codex_mode; then
+      if [ -n "$REAL_CODEX" ]; then
+        exec "$REAL_CODEX" "$@"
+      fi
+      echo "codex shim is in native Codex mode, but no real codex binary was found; set CODEX_REAL" >&2
+      exit 127
+    fi
+    # One-shot probes the shim can settle on its own. The adapter answers
+    # the rest of them, also without opening its state.
+    print_startup_config "$@" && exit 0
+    no_daemon_running "$@" && exit 1
+    exec "$NODE_BIN" "$ADAPTER" "$@"
+    ;;
+esac
 
 if [ -n "$REAL_CODEX" ]; then
   exec "$REAL_CODEX" "$@"
 fi
 
-echo "Chrys codex shim supports --version and app-server; set CODEX_REAL for other commands" >&2
+echo "codex shim supports --version and app-server; set CODEX_REAL for fallback" >&2
 exit 127

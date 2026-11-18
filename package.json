@@ -1,12 +1,20 @@
 {
-  "name": "chrys-codex-adapter",
+  "name": "claude-codex-adapter",
   "version": "0.1.0",
   "private": true,
-  "description": "Codex app-server compatibility adapter for the Chrys ACP agent.",
+  "description": "Remote-mode adapter that lets the Codex desktop app talk to Claude Code through the Codex app-server protocol.",
   "license": "MIT",
+  "homepage": "https://fuergaosi233.github.io/claude-codex/",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fuergaosi233/claude-codex.git"
+  },
+  "bugs": {
+    "url": "https://github.com/fuergaosi233/claude-codex/issues"
+  },
   "type": "module",
   "bin": {
-    "chrys-codex-adapter": "dist/src/adapter.mjs"
+    "claude-codex-adapter": "dist/src/adapter.mjs"
   },
   "files": [
     "dist/",
@@ -25,33 +33,35 @@
     "check": "biome check src test scripts",
     "check:fix": "biome check --write src test scripts",
     "check:rust-protocol-fixtures": "node scripts/check-rust-protocol-fixtures.mjs",
+    "check:app-upgrade": "npm run build && node scripts/check-app-upgrade.mjs",
     "docs:dev": "vitepress dev docs",
     "docs:build": "vitepress build docs",
     "docs:preview": "vitepress preview docs",
     "test": "npm run build && node --test dist/test/*.mjs",
     "doctor": "node scripts/doctor.mjs",
-    "install:ssh-user": "npm run build && bash scripts/install-ssh-user.sh",
     "workflow": "npm run build && node dist/src/workflow-cli.mjs",
     "workflow:schedule": "npm run workflow -- schedule",
-    "smoke:real": "npm run build && node scripts/smoke-real-chrys.mjs",
-    "smoke:chrys": "npm run build && node scripts/smoke-real-chrys.mjs",
+    "smoke:real": "npm run build && node scripts/smoke-real-claude.mjs",
     "probe:capabilities": "npm run build && node scripts/probe-capabilities.mjs",
     "acceptance:local-remote": "npm run build && node scripts/acceptance-local-remote.mjs",
     "acceptance:gui-ssh-localhost": "npm run build && node scripts/acceptance-gui-ssh-localhost.mjs",
     "acceptance:ssh-runtime-matrix": "npm run build && node scripts/acceptance-ssh-runtime-matrix.mjs",
     "probe:codex-cli-remote": "npm run build && node scripts/probe-codex-cli-remote.mjs",
     "start": "node dist/src/adapter.mjs",
-    "generate:schema": "codex app-server generate-ts --experimental --out generated/codex-app-server"
+    "generate:schema": "codex app-server generate-ts --experimental --out generated/codex-app-server",
+    "smoke:chrys": "npm run build && node scripts/smoke-real-chrys.mjs",
+    "install:ssh-user": "npm run build && bash scripts/install-ssh-user.sh",
+    "smoke:antigravity": "npm run build && node scripts/smoke-real-antigravity.mjs"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.3.280",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.304",
     "ws": "^8.21.3"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.14",
-    "@types/node": "^26.6.1",
+    "@types/node": "^26.6.2",
     "@types/ws": "^8.18.1",
-    "tsx": "^4.23.13",
+    "tsx": "^4.23.15",
     "typescript": "^7.0.2",
     "vitepress": "^1.6.4"
   },

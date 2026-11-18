@@ -1,135 +1,524 @@
-# Chrys Codex Adapter
+> 本仓库的本机扩展：已合并上游 `b77103b`，支持 Chrys 与 Antigravity ACP。
+> [Antigravity 本机接入与验收](docs/antigravity-local.md) · [Chrys 本机接入](docs/chrys-local.md)
 
-把 Chrys ACP 二进制包装成 Codex `app-server`，供 Codex 桌面应用通过 Remote SSH 使用。
-Codex App 本身无需修改，原生 `Control this Mac` 仍使用官方 Codex CLI。
+# Claude Codex Adapter
 
-```text
-Codex App
-├── Control this Mac ──▶ 官方 Codex CLI
-└── Chrys Local (SSH) ──▶ codex shim ──▶ Chrys Codex Adapter ──▶ chrys acp
-```
+[![CI](https://github.com/fuergaosi233/claude-codex/actions/workflows/ci.yml/badge.svg)](https://github.com/fuergaosi233/claude-codex/actions/workflows/ci.yml)
+[![Docs](https://github.com/fuergaosi233/claude-codex/actions/workflows/deploy-docs.yml/badge.svg)](https://fuergaosi233.github.io/claude-codex/)
+[![Node](https://img.shields.io/badge/node-%3E%3D24-brightgreen)](https://nodejs.org)
 
-## 已实现能力
+Production TypeScript adapter that lets the **Codex desktop app** talk to
+**Claude Code** through the native Codex `app-server` protocol in Remote mode.
 
-- Codex `initialize`、模型目录以及配置协议
-- 任务创建、列表、读取、恢复、归档和持久化
-- Chrys ACP `session/new`、`session/load`、`session/prompt` 和 `session/cancel`
-- 文本、推理、工具调用和用量的实时事件
-- 命令与文件修改审批
-- Chrys `_chrys/request_input` 到 Codex 原生问题卡片
-- 文件修改和 `turn/diff/updated`
-- stdio、WebSocket、Unix socket 和 `app-server proxy`
+Codex App still runs its normal SSH version probe, bootstrap, and `app-server
+proxy` flow — but `codex app-server` is handled by this adapter instead of the
+real Codex runtime, so agent turns run on Claude Code.
 
-## 要求
+<p align="center">
+  <img src="docs/public/images/inline-visualization.png" width="720"
+    alt="A Claude reply in the Codex App with an inline visualization: tiles for total signups, the peak month and quarter-over-quarter growth, a bar chart of six months of signups with the peak month highlighted and a dashed monthly average, a chart of month-over-month change, and a short summary of the trend">
+</p>
 
-- macOS 或 Linux
-- Node.js 24+
-- 已安装并可运行的 Chrys 二进制
-- Codex 桌面应用
-- 一个用于 Chrys 的 SSH 用户。推荐独立用户，避免其 `codex` shim 影响原生 CLI。
+<p align="center"><sub>Claude, asked in a Codex App chat to chart six months of signups,
+answers with an <a href="#inline-visualizations">inline visualization</a> that the
+App renders inside the reply. The request was in Chinese, so are the labels.</sub></p>
 
-## 构建与真实验证
+📖 **Documentation: <https://fuergaosi233.github.io/claude-codex/>**
+
+## Quick start
 
 ```bash
 npm install
-npm run build
-npm run smoke:chrys
+npm run build        # tsc -> dist/ (production artifact)
+npm run dev          # tsx src/adapter.mts — run sources directly, no build
+npm run doctor       # environment self-check
 ```
 
-`smoke:chrys` 会调用真实 Chrys，验证模型目录、两轮会话恢复、审批、文件创建和 diff。
+> **Requires Node.js 24+** for stable `node:sqlite`. Set `CLAUDE_CODEX_NODE` to
+> pin a node binary if your default is older.
 
-## 安装到 Chrys SSH 用户
-
-如果还没有专用用户，在 macOS **系统设置 → 用户与群组**中新建标准用户 `chrys-agent`，再到
-**系统设置 → 通用 → 共享 → 远程登录**允许该用户登录。为 Codex App 创建独立密钥：
+Then install the `codex` shim on the remote host and add a Remote connection in
+the Codex App:
 
 ```bash
-ssh-keygen -t ed25519 -f "$HOME/.ssh/chrys_codex" -C chrys-codex
-ssh-copy-id -i "$HOME/.ssh/chrys_codex.pub" chrys-agent@127.0.0.1
-ssh -i "$HOME/.ssh/chrys_codex" chrys-agent@127.0.0.1 'echo ssh-ok'
+mkdir -p ~/bin
+cp scripts/codex-shim ~/bin/codex && chmod +x ~/bin/codex
+export PATH="$HOME/bin:$PATH"
+export CLAUDE_CODEX_ADAPTER="$PWD/dist/src/adapter.mjs"
+export ANTHROPIC_API_KEY="<your-anthropic-api-key>" # or authenticate with `claude /login`
 ```
 
-把 Chrys 二进制和本工程放到该用户可访问的位置，并确认在该用户中执行 `chrys --version`
-成功。以下命令均在专用用户下执行：
+Provide credentials only through your local shell or secret manager. Do not
+commit API keys, OAuth/session data, `.env` files, or acceptance-test logs.
+
+Full walkthrough → **[Getting started](https://fuergaosi233.github.io/claude-codex/guide/getting-started)**.
+
+## How it works
+
+```
+Codex App ──SSH──▶ login shell ──▶ codex (shim, earlier in PATH)
+                                     │
+                  app-server calls ──┘──▶ Claude Codex Adapter ──▶ Claude Code
+                  everything else  ──────▶ real Codex CLI (CODEX_REAL)
+```
+
+Agent text and reasoning stream into the conversation, Claude's thinking as the
+reasoning summary the App shows (`CLAUDE_CODEX_REASONING_VISIBLE=0` hides it);
+`Bash` and other tools become command approvals; `Edit`/`Write`/`MultiEdit`
+become file-change approvals with live diffs; MCP tool calls get the App's MCP
+tool approval card. Runtime selection maps only to existing backend paths today: default
+in-process Claude Agent SDK, `agent-http`, `agentapi`, `claude-p`, `codex-proxy`,
+and `mock`.
+
+The App starts one adapter daemon with `codex app-server --listen unix://` and
+reaches it through `codex app-server proxy`. Neither names a socket, so both use
+`$CODEX_HOME/app-server-control/app-server-control.sock` by default. To put it
+somewhere else, set `CLAUDE_CODEX_SOCKET_PATH` to an absolute path in a folder of
+its own, in the login shell or `~/.claude-codex/runtime.env`, since the daemon
+and the proxy must agree on it. See
+[Configuration](https://fuergaosi233.github.io/claude-codex/guide/configuration).
+
+Each Claude thread runs its own Claude Code process. Several of them starting at
+the same moment, such as the chats that all resume their Claude sessions right
+after the adapter or the App restarts, write the user's Claude Code config
+(`~/.claude.json`) at once and can corrupt it
+([anthropics/claude-code#28847](https://github.com/anthropics/claude-code/issues/28847)).
+`CLAUDE_CODEX_SDK_LAUNCH_GATE=1` starts them one at a time instead: each waits
+until the one before has sent its first message, or for at most
+`CLAUDE_CODEX_SDK_LAUNCH_GATE_TIMEOUT_MS` (default 30000) when it stays silent.
+Prompts and steers sent meanwhile wait for their process. It is off by default.
+
+That process inherits the adapter's environment, so Claude Code's own variables
+work as they do in a terminal. For example, `CLAUDE_CODE_FORK_SUBAGENT=0` keeps
+Claude from starting fork subagents (`subagent_type: "fork"`), which Claude Code
+offers Agent SDK sessions by default since 2.1.302; a fork shows in the App as a
+subagent with the role `fork`. With model process profiles, a profile passes such
+a variable on only when its `inheritEnv` names it or its `env` sets it. See
+[Claude Code variables](https://fuergaosi233.github.io/claude-codex/guide/configuration#claude-code-variables).
+
+### Model process profiles
+
+By default every Claude thread runs the same Claude Code with the adapter's
+environment. With `CLAUDE_CODEX_MODEL_PROFILES_FILE` pointing at a profiles file
+(or the same JSON inline in `CLAUDE_CODEX_MODEL_PROFILES`), each Claude model in
+the picker runs a Claude Code process of its own instead: its own executable,
+provider environment and Claude config folder, with none of the adapter's
+provider credentials. Secrets stay in the environment or in private env files;
+the profiles file only references them. A chat stays on the profile it started
+on. Once that profile's configuration changes, or for a chat from before
+profiles were set up, the chat still opens to be read, but a new message asks
+for a new chat rather than resuming its session somewhere else. Without a
+profiles file nothing changes. See
+[Model process profiles](https://fuergaosi233.github.io/claude-codex/guide/configuration#model-process-profiles)
+for the file format, its safety rules and how it relates to
+`CLAUDE_CODEX_MODELS`.
+
+### Desktop conversation and visual explanations
+
+The native Claude Agent SDK backend receives presentation guidance modeled on
+Claude Desktop's conversational style: natural explanations, enough detail for
+complex questions, and formatting chosen for the content instead of a fixed
+engineering report. Questions invite discussion; requests for action still use
+and verify tools. Progress updates explain meaningful transitions while native
+tool events retain execution details.
+
+The guidance describes Codex desktop's Markdown and Mermaid rendering. For
+explanations that benefit from a diagram, Claude is encouraged to use a fenced
+`mermaid` flowchart or sequence diagram, while keeping simple answers brief and
+respecting requested language and formats. This supplements the Claude Code
+preset and preserves explicit project/developer/personality preferences. No global
+`~/.claude/CLAUDE.md` changes are needed; schema-constrained turns do not receive
+this presentation guidance.
+
+Rendering is provided by the Codex app version you use. The adapter preserves the
+Markdown in streaming and history; it does not bundle a diagram renderer or a
+Claude Desktop Artifacts runtime. Arbitrary HTML/React code fences do not become
+interactive apps (inline visualizations, below, go through the App's own
+sandbox). Older clients may show Mermaid source instead of a diagram.
+
+### Inline visualizations
+
+Claude threads can show charts, diagrams and small interactive explainers inside
+the conversation, rendered by the Codex App's own visualization sandbox, as Codex
+threads do. The adapter remembers the `visualize` plugin the App installs at
+startup and lists its skill in the system prompt, with the
+`::codex-inline-vis{path="…"}` line the App renders and the thread's
+visualization folder. Claude reads the skill when a request calls for it, writes
+an HTML fragment there and names it in its reply.
+
+The App reads visualizations only for UUIDv7 thread ids, as Codex issues them.
+New threads, forks and subagents get one; chats created before keep working but
+cannot render inline visualizations. The file rules (a lowercase hyphenated
+`.html` name, an absolute path inside the thread's folders or `/tmp`, at most
+5 MB) are in
+**[Using the Codex App](https://fuergaosi233.github.io/claude-codex/guide/gui#inline-visualizations)**.
+
+### Pull Requests panel
+
+The Codex App's Pull Requests panel talks to the MCP server of its bundled
+`code-review` plugin, which the App turns on with a `-c` setting when it starts
+the app-server. With `CLAUDE_CODEX_APP_PLUGIN_MCP=1` the adapter runs that
+server for the App's own calls (`mcpServerStatus/list`, `mcpServer/tool/call`,
+`mcpServer/resource/read`): one long-lived process per adapter, started from the
+plugin's folder with its `.mcp.json` command, `CODEX_MCP_NODE_PATH` pointing at
+a Node.js binary, and only a short list of environment variables (the basics
+such as `HOME` and `PATH`, plus the variables the plugin lists, minus any whose
+name looks like a credential). A comma-separated list of plugin names runs other
+plugins' servers the same way; `codex-app-tools` and `browser-use` are never
+run. It is off by default, and the server is never offered to Claude threads.
+
+The plugin uses the host's GitHub credentials, for example an existing `gh`
+login; the adapter does not read, log or pass on any token. Starting a review
+from the panel runs the Codex CLI's own `exec`, which needs a working Codex
+install and sign-in, and the plugin's ChatGPT-backed GitHub connection is not
+available, since it would start a second app-server. Details are in
+**[Using the Codex App](https://fuergaosi233.github.io/claude-codex/guide/gui#pull-requests-panel)**.
+
+### Project instructions
+
+Claude threads follow the same `AGENTS.md` files Codex would: the global one in
+`CODEX_HOME` (`AGENTS.override.md` first), then one per folder from the git root
+down to the thread's folder, within Codex's 32 KiB project budget. They reach
+Claude in the system prompt with Codex's framing, and the App lists them as the
+thread's instruction sources. Files Claude Code already reads itself through a
+`CLAUDE.md` import are not sent twice.
+
+When the Claude CLI runs with its setting sources turned off, set
+`CLAUDE_CODEX_CLAUDE_CONFIG_DIR` (usually `~/.claude`) to bring that Claude Code
+configuration along: the user and project `CLAUDE.md` files with their
+`@imports`, `CLAUDE.local.md`, `.claude/rules/` (rules scoped by `paths:` are
+listed for Claude to read when they apply), and the user and project skills. The
+folder's MCP servers, subagents, permission rules and hooks come along only with
+their own switches (see below), as the Codex config's servers do.
+
+### Inherited configuration
+
+With `CLAUDE_CODEX_CODEX_MCP_SERVERS=1`, Claude threads start the MCP servers in
+the Codex config: `[mcp_servers.<name>]` in `CODEX_HOME/config.toml`, plus the
+`.codex/config.toml` files of a project Codex trusts. This is off by default
+because the Codex App writes its own desktop servers (such as a computer-use
+client and a Node REPL) into `config.toml` for Codex threads, and those would
+otherwise land in every Claude thread. Stdio servers keep their `args`, `env`,
+`env_vars` and `cwd`; streamable HTTP servers keep their headers and bearer
+token. The server configs reach the CLI in a file only the user can read, in the
+adapter's home, removed when the CLI session ends, rather than on the CLI's
+command line, where any local process can read them. The values `env_vars`,
+`env_http_headers` and `bearer_token_env_var` name stay out of that file too: it
+refers to them as `${NAME}`, and the CLI fills them in from the environment it
+gets from the adapter. So a launcher that rebuilds the CLI's environment from an
+allowlist drops them, and like any server config's references they never take
+the CLI's own credentials nor, toward a remote server, a credential name on the
+CLI's list (such as `VAULT_TOKEN` or `NPM_TOKEN`), which arrives empty: give
+such a value another name. Values written into the Codex config are passed on as
+written, `${...}` included, as Codex passes them. A server with
+`enabled = false` stays off, `disabled_tools` are withheld from Claude, a call
+to a tool outside `enabled_tools` is refused, and `tool_timeout_sec` becomes the
+server's tool-call timeout. Codex OAuth logins, `startup_timeout_sec`,
+`required`, per-tool approval settings and the servers plugins bring are not
+carried over to Claude threads (the App's own Pull Requests panel calls are
+served separately, see above). Claude Code signs in to MCP servers itself, and
+the Agent SDK cannot start that sign-in, so a sign-in the App asks for fails
+rather than opening a page that leads nowhere. The error says to sign in with `/mcp` in a
+Claude Code session; the App does not show its text, only that it couldn't
+connect. Every new session picks up such a sign-in, and a client's
+`config/mcpServer/reload` lets a session that is still open reconnect.
+
+With `CLAUDE_CODEX_CLAUDE_CONFIG_DIR` set and
+`CLAUDE_CODEX_CLAUDE_MCP_SERVERS=1`, Claude threads start the Claude Code
+servers: user-scope servers and the project's local-scope servers from the
+global config file (`~/.claude.json` for `~/.claude`), and the servers of the
+project's `.mcp.json` files (from the repository root down to the thread's
+folder) once the project is trusted and the server is approved in the user's own
+settings (`enabledMcpjsonServers` or `enableAllProjectMcpServers`). The project
+is trusted when Codex trusts it or the user accepted Claude Code's trust dialog
+for the project itself, that is the repository's main checkout (a worktree
+shares it) or the folder outside a repository; trust accepted for a folder above
+does not count. A checkout's `.git` file is the checkout's to write, so it only
+leads to a main checkout when git's own records vouch for the link: the
+worktree's folder in that repository's `.git/worktrees` points back at it. The
+checked-in `.claude/settings.json` cannot approve servers, and neither can a
+`.claude/settings.local.json` that is checked in (under any spelling of its
+path, since the file system may ignore case where git does not), reached
+through a symlink anywhere below the repository root or in a checkout whose
+`.git` file git does not vouch for, since that file then comes from the
+repository rather than the user. A server's
+`${VAR}` references are left for the CLI to fill in from its environment, as it
+does for its own config files, and a local-scope server's `headersHelper` runs
+only in a trusted project. A Claude Code server wins a name over a Codex one,
+and `CLAUDE_CODEX_MCP_SERVERS` wins over both. Only the thread's own turns get
+these servers, not summaries or other internal turns; the App's MCP panel lists
+those of the thread it asks about.
+
+With `CLAUDE_CODEX_CLAUDE_AGENTS=1`, the bridged Claude Code folder also brings
+its subagents: `agents/*.md` in it, then `.claude/agents/*.md` from the git root
+down to the thread's folder, a project agent winning a name over a user agent.
+Their `name`, `description`, `tools`, `disallowedTools`, `model`, `skills`,
+`maxTurns`, `effort`, `memory`, `background`, `initialPrompt`,
+`autoCompactWindow` and named `mcpServers` carry over; `permissionMode`, `hooks` and inline server definitions
+do not, since the Codex approval policy decides what runs.
+
+With `CLAUDE_CODEX_CLAUDE_PERMISSIONS=1`, its permission rules apply as well.
+`permissions.deny` from the user's `settings.json` and the project's
+`.claude/settings.json` and `.claude/settings.local.json` always applies: a
+denied tool stays refused whatever the approval policy. So does
+`permissions.ask`: the CLI takes no ask rules outside a settings file, so the
+adapter registers a `PreToolUse` callback that sends the calls they cover to the
+Codex approval prompt, even when an allow rule or a hook would approve them. It
+matches them as Claude Code does and errs towards asking: a Bash rule covers
+each command of a compound command line and what wrappers such as `timeout`,
+`xargs` or `sh -c` run, a command line with command substitution, a heredoc or
+a command named by a variable is asked about under any Bash rule, since it could
+run anything, and an `Edit` rule covers every tool that edits files, a `Read`
+rule `Glob` and `Grep` by the folder they search. Under Full Access the prompt
+is approved without asking, as every other one is; in plan mode an asked-for
+call is refused. `permissions.allow` lets matching tool calls run without a
+Codex approval prompt; the user's rules always count, a project's only once the
+project is trusted (those of a `settings.local.json` the repository supplies
+never), and none in plan mode or a read-only sandbox, where Codex would not let
+those tools run unasked. A user rule's `/path` stays relative to the config
+folder, as in Claude Code. A rule saved from an approval card ("Allow similar
+commands", "Always allow"; see [Approvals](docs/guide/gui.md#approvals)) goes
+to the project's `.claude/settings.local.json`, so it counts here once the
+project is trusted. `defaultMode` and `additionalDirectories` are not
+carried over: the Codex approval policy and sandbox decide the mode and the
+folders.
+
+Its command hooks run only when asked for too: they are often status or
+notification integrations for terminal sessions, and running them for every App
+chat would silently change what they do (a hook that waits for input would even
+hold up the turn). `CLAUDE_CODEX_CLAUDE_HOOKS=user` runs the hooks in the
+bridged folder's `settings.json`; `CLAUDE_CODEX_CLAUDE_HOOKS=project` also runs
+those of a trusted project's `.claude/settings.json` and
+`.claude/settings.local.json`, so a repository never runs a command on its own
+say; unset, `0` or any other value runs none. The Claude CLI must then start
+without its setting sources, as the bridged folder expects, or it runs the same
+hooks itself and each runs twice; the adapter warns as it starts, plainly when
+`CLAUDE_CODEX_CLI` is unset, since the CLI the SDK starts reads every source. It
+leaves those sources alone, as a CLI started directly still needs them for its
+provider settings. They run for `PreToolUse`,
+`PostToolUse`, `PostToolUseFailure`, `UserPromptSubmit`, `Stop`,
+`SubagentStart`, `SubagentStop`, `SessionStart`, `SessionEnd` and
+`Notification`. The adapter registers each command with the Claude Agent SDK;
+the CLI matches it as it would a settings hook and the adapter runs it the way
+Claude Code does: with `sh -c` (`bash -c` for `shell: "bash"`, no shell in exec
+form with `args`), the hook input as JSON on stdin, `CLAUDE_PROJECT_DIR` set,
+its `timeout` (by default 10 minutes, 30 seconds for `UserPromptSubmit`, 1.5
+seconds for `SessionEnd`) and `async` honored. A session's `SessionEnd` hooks
+also share one budget, the longest of their timeouts from 1.5 seconds up to a
+minute, and `CLAUDE_CODE_SESSIONEND_HOOKS_TIMEOUT_MS` sets both, as in Claude
+Code. A hook's `if`, a permission rule such as `Bash(git *)`, is matched against
+the tool call as the adapter matches ask rules (so a command line it cannot take
+apart runs the hook); as in Claude Code, a hook with `if` on an event that is
+not about a tool never runs, and `once`, which Claude Code honors only for hooks
+a skill or agent defines, means nothing in a settings file. A hook is done when
+its own process exits; a background process it started keeps running and can
+still write to the hook's output, while a hook that times out is killed with
+everything it started. Exit 0 passes JSON output on (plain output becomes
+context for `UserPromptSubmit` and `SessionStart`), exit 2 blocks with stderr as
+the reason (for `SubagentStart`, `SessionStart` and `SessionEnd` it only shows
+stderr, for `Notification` it does nothing), other exits are non-blocking
+errors, and `disableAllHooks` turns them all off. A hook with
+`onFailure: "block"` fails closed, as in Claude Code: when it cannot start,
+times out, exits with a code other than 0 or 2, or prints JSON that does not
+parse, it answers as exit 2 would, with a reason that names the hook and the
+failure; async hooks and `Stop` and `SubagentStop` hooks ignore it. In plan mode
+or a read-only sandbox a hook can still deny or ask but its approval is dropped,
+leaving the call to Codex.
+The CLI runs `SessionStart` hooks for a new, resumed or forked
+session before the SDK has registered its callbacks, and `SessionEnd` hooks
+after the SDK has let go of them, so the adapter runs those two itself:
+`SessionStart` once the session takes its first prompt, with the source
+`startup`, `resume` or `fork` matched as the CLI matches it, its context and
+`systemMessage` reaching Claude and the user along with that prompt;
+`SessionEnd`, with the reason `other`, when the CLI session is over, for a
+session that took a prompt. A session still open when the adapter stops ends
+with it: the hooks of all such sessions run before the adapter exits and share
+one budget, as those of a single CLI would. The CLI itself still runs
+`SessionStart` for `compact` and `clear`. Prompt, agent and HTTP hooks, PowerShell hooks,
+`asyncRewake`'s wake-up, `CLAUDE_ENV_FILE`, and other events (such as
+`PreCompact`, whose output a callback cannot pass back, or `PermissionRequest`,
+which the Codex approval flow owns) are not carried over. Point
+`CLAUDE_CODEX_CLAUDE_CONFIG_DIR` only at a folder the CLI does not read itself,
+or its hooks run twice.
+
+With `CLAUDE_CODEX_CODEX_NOTIFY=1`, the `notify` program of
+`CODEX_HOME/config.toml` runs when a Claude thread's turn completes, as Codex
+runs it for its own turns: the configured argv plus one JSON argument,
+`{"type":"agent-turn-complete", "thread-id", "turn-id", "cwd", "client",
+"input-messages", "last-assistant-message"}`. This is off by default because the
+Codex App sets `notify` to its own turn-ended program for Codex threads, which
+would otherwise be called after every Claude turn. The adapter does not wait for
+the program, ends it after 30 seconds and writes its stderr to the debug log.
+Summaries and other internal turns, and Codex model threads (whose own Codex
+runs it), do not notify; a project's `.codex/config.toml` cannot set it.
+
+`model_auto_compact_token_limit`, set with `config/value/write` or in the config
+a thread starts with, becomes Claude Code's auto-compact window for Claude
+threads (`CLAUDE_CODE_AUTO_COMPACT_WINDOW`, kept within the 100,000 to
+1,000,000 tokens Claude Code takes), winning over the window in Claude Code's
+own settings. With `CLAUDE_CODEX_CODEX_AUTO_COMPACT=1`, the key in
+`CODEX_HOME/config.toml` or a trusted project's `.codex/config.toml` counts
+too. This is off by default because users set that key for Codex models, and
+it would otherwise replace their Claude Code window on every Claude thread.
+Unset, Claude Code keeps its own window. See
+**[Configuration](https://fuergaosi233.github.io/claude-codex/guide/configuration#context-compaction)**.
+
+### Leader chats
+
+With `CLAUDE_CODEX_LEADER_TOOLS=1` (off by default), Claude in a chat you
+started gets the `codex_leader` MCP server, whose tools start other Claude chats
+(`thread_start`), list them (`thread_list`), wait for them (`thread_wait`), send
+them messages (`thread_prompt`) and read them (`thread_read`). Each started chat
+is an ordinary chat in the Codex App sidebar, which you can open and keep talking
+to. When Claude repeats the line `thread_start` returns, its reply shows a card
+for the chat, as Codex does for the chats it starts. Started chats get the
+leader's permissions and never more, and cannot lead in turn; a leader has at
+most `CLAUDE_CODEX_LEADER_MAX_RUNNING` (default 4) chats working at once, and it
+never answers their approvals or questions: those stay with you. The tools need
+the native Claude Agent SDK backend; see
+**[Using the Codex App](https://fuergaosi233.github.io/claude-codex/guide/gui#leader-chats)**.
+
+### `/workflows` compatibility
+
+With the native Claude Agent SDK backend, `/workflows <task>` is translated to Claude's
+`ultracode:` workflow trigger. Workflow task events are exposed as Codex-native reviewable
+Subagent threads. While a local workflow runs, the adapter tails its journal and projects each
+inner agent through Codex's native `subAgentActivity` lifecycle (with `completed` sent only to
+clients that advertise it) plus `spawnAgent`/`wait` tool state; runtimes without journal metadata
+fall back to one aggregate workflow agent when the workflow reaches a terminal state.
+Each inner agent's thread is named by its workflow label (else the first line of its task).
+A bare `/workflows` lists workflow runs
+recorded in the current Codex thread.
+
+A turn waiting on a subagent or workflow gives up only after it has heard nothing from it for
+`CLAUDE_CODEX_SUBAGENT_TIMEOUT_MS` (default 30 minutes; `0` never gives up). Any sign of life
+(the agent's output or tool heartbeats, task progress, a workflow agent starting or finishing)
+starts that wait over, so a long but healthy workflow runs to the end. The wait is paused while
+the turn waits on the user, and time the computer spends asleep does not count. When it does
+give up, the turn fails and its stuck agents stop; background agents it handed off keep
+running. See the
+[configuration reference](https://fuergaosi233.github.io/claude-codex/guide/configuration#reference-table).
+
+A subagent's thread shows the subagent's own work as it goes (its messages, thinking, and tool
+calls with their results) and keeps it with the thread; the parent chat shows none of it.
+`CLAUDE_CODEX_SUBAGENT_ITEMS=0` keeps a subagent's thread to its prompt and answer.
+
+This compatibility layer is specific to the native Claude Agent SDK backend. Alternate HTTP,
+agentapi, and `claude -p` backends receive no workflow event bridge. Interactive workflow
+management actions such as pause, resume, stop, and save are not implemented.
+
+When Codex Full Access is selected, the adapter keeps Claude in its standard permission mode and
+auto-allows permission requests through the existing Codex bridge. This avoids Relay's refusal of
+dangerous permission bypass outside a recognized container sandbox while preserving a zero-prompt
+Full Access turn. Operators can still opt into native SDK bypass explicitly with
+`CLAUDE_CODEX_PERMISSION_MODE=bypassPermissions` in an appropriately isolated environment.
+
+## Current release boundaries
+
+- **Production path:** the TypeScript app-server adapter remains the shipping
+  path for Codex desktop Remote mode and Claude Code.
+- **Rust-first work:** RFCs, a workspace scaffold, protocol fixtures, parse /
+  reserialize tests, and pinned fixture drift checks are present. Rust does not
+  replace the production runtime, transport, store, or launcher yet.
+- **Provider and agent-loop work:** descriptors, sanitized `config/read`
+  projection, and explicit provider/loop selection are implemented. Selection
+  is metadata and routing for known descriptors only; it maps to existing
+  runtime backends and does not add a new executable provider loop.
+- **Credential model:** use local user-owned API keys, official cloud-provider
+  credential chains, local CLI auth on the same host, or organization-managed
+  gateways that own billing, policy, audit, and provider compliance.
+- **Unsupported:** personal subscription pooling, browser cookie or session-token
+  reuse, credential sharing, private endpoint use, provider bypass behavior, and
+  claims of unavailable entitlements.
+- **Release checks:** CI runs `npm run check`, `npm run typecheck`, `npm test`,
+  `cargo test --workspace`, and the pinned Rust fixture drift check. Docs changes
+  should run `npm run docs:build`; credentialed smoke and acceptance checks stay
+  opt-in with user- or organization-owned credentials.
+
+See the
+**[release readiness reference](https://fuergaosi233.github.io/claude-codex/reference/release-readiness)**
+for the verification matrix and reviewer checklist.
+
+## Documentation
+
+| Topic | Link |
+| --- | --- |
+| Getting started | <https://fuergaosi233.github.io/claude-codex/guide/getting-started> |
+| Deployment (remote host) | <https://fuergaosi233.github.io/claude-codex/guide/deployment> |
+| Using the Codex App | <https://fuergaosi233.github.io/claude-codex/guide/gui> |
+| Configuration | <https://fuergaosi233.github.io/claude-codex/guide/configuration> |
+| Backends | <https://fuergaosi233.github.io/claude-codex/guide/backends> |
+| Capability matrix | <https://fuergaosi233.github.io/claude-codex/reference/capability-matrix> |
+| Workflow operations | <https://fuergaosi233.github.io/claude-codex/reference/workflow-operations> |
+| Release readiness | <https://fuergaosi233.github.io/claude-codex/reference/release-readiness> |
+| Contributing / toolchain | <https://fuergaosi233.github.io/claude-codex/contributing> |
+| Security policy | [SECURITY.md](SECURITY.md) |
+| Safe examples | [examples/](examples/) |
+
+Docs source lives in [`docs/`](docs/) and is published with VitePress. For
+contributors, the repo also ships progressive `AGENTS.md` files (root + `src/` +
+`scripts/` + `test/`).
+
+## Development
 
 ```bash
-cd /path/to/chrys-codex-adapter
-npm install
-npm run install:ssh-user
+npm run dev          # run from TypeScript via tsx
+npm run typecheck    # tsc --noEmit
+npm run check        # biome format + lint
+npm test             # build + node --test
+npm run docs:dev     # preview this documentation site
 ```
 
-安装位置默认为：
+See **[Contributing](https://fuergaosi233.github.io/claude-codex/contributing)**
+for the full toolchain and conventions.
 
-```text
-~/.local/share/chrys-codex-adapter/dist/src/adapter.mjs
-~/bin/codex
-~/.chrys-codex/
-```
+## Workflow operations
 
-确保 SSH 非交互登录也能找到 `~/bin/codex` 和 Chrys。macOS 默认 shell为 zsh 时，可在该用户的
-`~/.zshenv` 中设置：
+The adapter includes a small workflow control plane for long-running Codex
+maintenance loops. It is intentionally file-backed and explicit: the scheduler
+tracks tasks in `~/.codex/claude-codex-adapter/workflow-state.json`, and a task
+only runs after it has been queued and leased.
 
 ```bash
-export PATH="$HOME/bin:$HOME/.local/bin:$PATH"
-export CHRYS_CODEX_ADAPTER="$HOME/.local/share/chrys-codex-adapter/dist/src/adapter.mjs"
-export CHRYS_CODEX_EXECUTABLE="$HOME/.local/bin/chrys"
+npm run workflow -- status
+npm run workflow -- health
+npm run workflow -- enqueue --id task-id --prompt "Do one concrete task"
+npm run workflow -- schedule --worker codex-heartbeat
+npm run workflow -- heartbeat --task task-id --worker codex-heartbeat
+npm run workflow -- complete --task task-id
 ```
 
-从另一终端验证：
+Use `health` from recurring heartbeats before doing more work. A healthy loop
+has no stale leases, no failed tasks, and either no running task or one running
+task with an active lease. If a lease is still active, continue that task or
+renew the heartbeat only when more time is needed. Do not enqueue duplicates.
+
+Run events are appended to
+`~/.codex/claude-codex-adapter/runs.jsonl` by default. The registry redacts
+prompt-like fields, model responses, and secret-like values before writing. Set
+`CLAUDE_CODEX_RUN_LOG=0` to disable it, or set `CLAUDE_CODEX_RUN_LOG=/path/log`
+to choose a different JSONL file.
+
+Optional per-thread worktree isolation is controlled with
+`CLAUDE_CODEX_WORKTREE_ROOT`. Thread ids are mapped to root-confined,
+collision-resistant labels, and an existing worktree is reused when present.
+If worktree setup fails, the adapter logs the failure and keeps the original
+cwd so the app-server session can continue.
+
+GitHub issue or PR automation must go through the trust-boundary queue. Export
+only trusted metadata to local JSON, then ingest it:
 
 ```bash
-ssh chrys-agent@127.0.0.1 'command -v codex; codex --version; command -v chrys'
+gh issue list --json number,title,state,url > /tmp/github-issues.json
+npm run workflow -- ingest-github --github-json /tmp/github-issues.json
 ```
 
-期望 `codex --version` 类似：
+The ingestion step creates explicit workflow tasks from `number`, `title`,
+`state`, `url`, and item kind only. Body text, comments, reviews, and other
+external instructions are intentionally omitted from generated prompts, so a
+later agent must inspect external text through the project trust-boundary
+workflow before changing code.
 
-```text
-codex-cli 0.142.3 (chrys-codex)
-```
+## License
 
-## Codex App 配置
-
-打开 **Settings → Connections → SSH → Add**：
-
-```text
-Display name: Chrys Local
-Hostname: chrys-agent@127.0.0.1
-SSH port: 22
-Identity: Chrys 专用 SSH 密钥
-```
-
-保存后，在创建任务时选择 `Chrys Local`。原生任务继续选择 `Control this Mac`。
-
-这个连接窗口只配置 SSH 主机和身份，不提供 Agent 或可执行文件路径。Codex App 登录后会直接执行
-`codex --version` 和 `codex app-server ...`，因此适配器通过专用用户的 `PATH` 让 `~/bin/codex`
-被优先找到；这也是使用独立 SSH 用户的原因。
-
-## Shim 行为
-
-专用用户的 `~/bin/codex` 只接管 Codex App 需要的入口：
-
-- `codex --version`：返回兼容版本。
-- `codex app-server ...`：启动本适配器，包括 `proxy` 模式。
-- 其他命令：设置 `CODEX_REAL` 时转发给真实 Codex CLI，否则明确失败。
-
-## 配置
-
-| 环境变量 | 默认值 | 说明 |
-|---|---|---|
-| `CHRYS_CODEX_EXECUTABLE` | `chrys` | Chrys 二进制路径 |
-| `CHRYS_CODEX_AGENT` | `Code` | Chrys 主 Agent 名称 |
-| `CHRYS_CODEX_HOME` | `~/.chrys-codex` | 任务数据库、socket 和日志目录 |
-| `CHRYS_CODEX_ADAPTER` | 安装目录下的 `adapter.mjs` | shim 使用的适配器入口 |
-| `CHRYS_CODEX_NODE` | `node` | Node.js 24+ 可执行文件 |
-| `CHRYS_CODEX_COMPAT_VERSION` | `0.142.3` | shim 对 Codex App 报告的兼容版本 |
-| `CODEX_REAL` | 未设置 | 非 app-server 命令的官方 Codex CLI 回退路径 |
-
-## 开发验证
-
-```bash
-npm run typecheck
-npm test
-npm run smoke:chrys
-```
-
-协议兼容层派生自 MIT 许可的 `fuergaosi233/claude-codex`，具体见 `NOTICE` 和 `LICENSE`。
+[MIT](LICENSE)

@@ -1,17 +1,19 @@
-import { createHash, randomUUID } from 'node:crypto'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
 import {
   appendFileSync,
   existsSync,
   mkdirSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   statSync,
   unlinkSync,
 } from 'node:fs'
 import { homedir, platform, tmpdir } from 'node:os'
-import { dirname, join, resolve } from 'node:path'
-import type { ImageInput } from './types.mjs'
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { loadClaudeModelProfiles, modelProfileFingerprint } from './model-profiles.mjs'
+import type { ImageInput, TurnToolOutput, UserInput } from './types.mjs'
 
 export function nowSeconds(): number {
   return Math.floor(Date.now() / 1000)
@@ -25,38 +27,92 @@ export function newId(): string {
   return randomUUID()
 }
 
+// Thread ids are UUIDv7, as Codex app-server makes them: the App reads a
+// thread's creation date from its id to find the thread's files, such as its
+// inline visualizations, and refuses to read them for any other id.
+// App rule: inline-visualizations
+export function newThreadId(): string {
+  const bytes = randomBytes(16)
+  bytes.writeUIntBE(Date.now(), 0, 6)
+  bytes.writeUInt8((bytes.readUInt8(6) & 0x0f) | 0x70, 6)
+  bytes.writeUInt8((bytes.readUInt8(8) & 0x3f) | 0x80, 8)
+  const hex = bytes.toString('hex')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+}
+
+const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+
+// Where the App looks for a thread's inline visualizations:
+// <CODEX_HOME>/visualizations/<UTC YYYY/MM/DD from the id>/<thread id>. Only
+// UUIDv7 thread ids have one.
+// App rule: inline-visualizations
+export function threadVisualizationDir(threadId: string): string | null {
+  if (!UUID_V7.test(threadId)) return null
+  const created = new Date(Number.parseInt(threadId.replace(/-/g, '').slice(0, 12), 16))
+  const day = [
+    String(created.getUTCFullYear()),
+    String(created.getUTCMonth() + 1).padStart(2, '0'),
+    String(created.getUTCDate()).padStart(2, '0'),
+  ]
+  return join(codexHome(), 'visualizations', ...day, threadId)
+}
+
 export function codexHome(): string {
   return resolve(process.env.CODEX_HOME || join(homedir(), '.codex'))
 }
 
 export function adapterHome(): string {
-  const configured = process.env.CHRYS_CODEX_HOME || process.env.CLAUDE_CODEX_HOME
-  if (configured) return resolve(configured)
-  if (process.env.CODEX_HOME) return resolve(join(codexHome(), 'chrys-codex-adapter'))
-  return resolve(join(homedir(), '.chrys-codex'))
-}
-
-// `initialize.codexHome` is also a host/session identity hint to Codex App.
-// Reporting the real ~/.codex path from a localhost SSH adapter makes the App
-// merge official local Codex sessions into the Chrys host. Keep this namespace
-// distinct even though the SSH bootstrap itself still uses CODEX_HOME for its
-// control socket and forwarded agent.
-export function reportedCodexHome(): string {
-  return resolve(process.env.CHRYS_CODEX_REPORTED_HOME || adapterHome())
+  return resolve(
+    process.env.CHRYS_CODEX_HOME ||
+      process.env.CLAUDE_CODEX_HOME ||
+      join(codexHome(), 'claude-codex-adapter'),
+  )
 }
 
 // Unix domain socket paths are bounded by sockaddr_un.sun_path — roughly 104
 // bytes on macOS and 108 on Linux. A deep CODEX_HOME (long usernames, nested
 // workspaces) silently blew past that and surfaced as a cryptic EINVAL on
 // connect. Fall back to a short, hashed path under the system temp dir.
+export function reportedCodexHome(): string {
+  return resolve(
+    process.env.CHRYS_CODEX_REPORTED_HOME ||
+      (process.env.CHRYS_CODEX_HOME ? adapterHome() : codexHome()),
+  )
+}
+
 export function socketPathLimit(): number {
   return platform() === 'darwin' ? 104 : 108
 }
 
+// CLAUDE_CODEX_SOCKET_PATH moves the socket. The daemon and the proxy each
+// resolve it, so both need it set. An explicit path is used as given, without
+// the short temp-directory fallback for a path too long for a socket.
 export function defaultSocketPath(): string {
-  const preferred = join(adapterHome(), 'app-server-control.sock')
+  const explicit = process.env.CLAUDE_CODEX_SOCKET_PATH?.trim()
+  if (explicit) return resolve(explicit)
+  const preferred = process.env.CHRYS_CODEX_HOME
+    ? join(adapterHome(), 'app-server-control.sock')
+    : join(codexHome(), 'app-server-control', 'app-server-control.sock')
   if (preferred.length <= socketPathLimit()) return preferred
   return join(tmpdir(), `ccx-${stableHash(preferred).slice(0, 16)}.sock`)
+}
+
+// The folders a cwd's sessions may be in under a Claude Code config dir's
+// projects: named after the cwd, and after its real path when that differs.
+export function projectSlugs(cwd: string): string[] {
+  const slug = (dir: string) => dir.replace(/[^a-zA-Z0-9-]/g, '-')
+  const slugs = [slug(cwd)]
+  try {
+    const real = realpathSync(cwd)
+    if (real !== cwd) slugs.push(slug(real))
+  } catch {}
+  return slugs
+}
+
+// `path` lies strictly below `root`; both are compared lexically.
+export function isPathInside(root: string, path: string): boolean {
+  const child = relative(root, path)
+  return child !== '' && child !== '..' && !child.startsWith(`..${sep}`) && !isAbsolute(child)
 }
 
 export function ensureParent(path: string): void {
@@ -138,12 +194,15 @@ export function platformOs(): string {
 }
 
 // Codex app-server protocol version the adapter advertises (codex --version /
-// initialize userAgent). Bump alongside the generated schema (`npm run
-// generate:schema`). The 0.130 -> 0.142 delta is additive/widening (new
-// optional methods + enum variants), so reporting 0.142 stays compatible with
-// older Codex App builds while satisfying newer ones' minimum-version probe.
-// Override per host with CLAUDE_CODEX_COMPAT_VERSION.
-const DEFAULT_CODEX_COMPAT_VERSION = '0.142.3'
+// initialize userAgent). The App turns its feature gates on by this version.
+// This is the Codex build of App 26.1013, the baseline (codexVersion in
+// scripts/app-baseline.json), so every gate that build and App 26.930 know is
+// on; codex 0.163.0 has the same app-server protocol. check:app-upgrade checks
+// each gate it turns on against the adapter. Older App builds only check a
+// minimum version. Keep the default in scripts/codex-shim the same. Override
+// per host with CLAUDE_CODEX_COMPAT_VERSION.
+// App rule: feature-gates
+const DEFAULT_CODEX_COMPAT_VERSION = '0.163.0-alpha.10.2'
 
 export function codexCompatVersion(): string {
   return (
@@ -158,7 +217,7 @@ export function codexCompatVersion(): string {
 // Claude adapter is identifiable next to a real `codex` that now reports the
 // same version. Set CLAUDE_CODEX_VERSION_SUFFIX="" to disable and behave exactly
 // like upstream codex.
-const DEFAULT_VERSION_SUFFIX = 'chrys-codex'
+const DEFAULT_VERSION_SUFFIX = 'claude-codex'
 
 export function codexVersionSuffix(): string {
   return (
@@ -172,6 +231,33 @@ export function codexCliVersion(): string {
   const suffix = codexVersionSuffix()
   // Number first so a semver probe still extracts the bare version.
   return `codex-cli ${codexCompatVersion()}${suffix ? ` (${suffix})` : ''}`
+}
+
+// The first Claude Code versions with a feature the adapter uses only when the
+// session's CLI has it: the get_task_output request behind live Bash output,
+// and the Agent tool's effort parameter.
+export const CLAUDE_CODE_TASK_OUTPUT_VERSION = '2.1.287'
+export const CLAUDE_CODE_AGENT_EFFORT_VERSION = '2.1.292'
+
+// Whether a Claude Code version, as system/init or the initialize reply
+// report it ("2.1.304"), is at least `minimum`. A version that is unknown or
+// cannot be read counts as new enough: a feature is never turned off only
+// because the version could not be read.
+export function claudeCodeAtLeast(version: string | null | undefined, minimum: string): boolean {
+  const have = versionParts(version)
+  const need = versionParts(minimum)
+  if (!have || !need) return true
+  for (let index = 0; index < 3; index += 1) {
+    const ours = have[index] ?? 0
+    const wanted = need[index] ?? 0
+    if (ours !== wanted) return ours > wanted
+  }
+  return true
+}
+
+function versionParts(value: string | null | undefined): number[] | null {
+  const match = /^\s*v?(\d+)\.(\d+)\.(\d+)/.exec(value ?? '')
+  return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : null
 }
 
 export function codexUserAgent(clientName: string, clientVersion: string): string {
@@ -194,11 +280,52 @@ export function textFromInput(input: unknown): string {
       if (value.type === 'mention') return `@${value.path ?? value.name ?? ''}`
       if (value.type === 'localImage') return `[local image: ${value.path ?? ''}]`
       if (value.type === 'image') return `[image]`
-      if (value.type === 'skill') return `/${value.name ?? 'skill'}`
+      if (value.type === 'skill') return skillInputText(value)
       return ''
     })
     .filter(Boolean)
     .join('\n')
+}
+
+// A skill input item reads like the link the composer writes for a picked
+// skill, so both reach Claude the same way (see turn-context.mts).
+// App rule: skill-injection
+function skillInputText(item: { name?: string; path?: string }): string {
+  const name = item.name || 'skill'
+  return item.path ? `[$${name}](${item.path})` : `/${name}`
+}
+
+export function turnToolOutputFromParams(value: unknown): TurnToolOutput | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const record = value as Record<string, unknown>
+  if (typeof record.name !== 'string') return null
+  const output =
+    typeof record.output === 'string'
+      ? record.output
+      : Array.isArray(record.output)
+        ? record.output.filter(
+            (part): part is Record<string, unknown> =>
+              !!part && typeof part === 'object' && !Array.isArray(part),
+          )
+        : null
+  if (output === null) return null
+  return {
+    name: record.name,
+    namespace: typeof record.namespace === 'string' ? record.namespace : null,
+    output,
+  }
+}
+
+// What Claude reads for a tool result: its text and images, as user input.
+export function toolOutputInput(output: TurnToolOutput['output']): UserInput[] {
+  if (typeof output === 'string') return output ? [{ type: 'text', text: output }] : []
+  return output.flatMap((part): UserInput[] => {
+    if (part.type === 'input_text' && typeof part.text === 'string')
+      return [{ type: 'text', text: part.text }]
+    if (part.type === 'input_image' && typeof part.image_url === 'string')
+      return [{ type: 'image', url: part.image_url }]
+    return []
+  })
 }
 
 // Split UserInput[] into the text prompt + a list of image inputs ready to
@@ -221,7 +348,7 @@ export function extractImageInputs(input: unknown): ImageExtractResult {
     const item = raw as { type?: string; text?: string; path?: string; name?: string; url?: string }
     if (item.type === 'text' && typeof item.text === 'string') texts.push(item.text)
     else if (item.type === 'mention') texts.push(`@${item.path ?? item.name ?? ''}`)
-    else if (item.type === 'skill') texts.push(`/${item.name ?? 'skill'}`)
+    else if (item.type === 'skill') texts.push(skillInputText(item))
     else if (item.type === 'localImage' && typeof item.path === 'string') {
       const img = readLocalImage(item.path)
       if (img) images.push(img)
@@ -291,6 +418,12 @@ export function stableHash(value: string): string {
   return createHash('sha256').update(value).digest('hex')
 }
 
+// `base` ended as a sentence, then `sentence` after it.
+export function appendSentence(base: string, sentence: string): string {
+  if (!base) return sentence
+  return `${/[.!?。！？]$/.test(base) ? base : `${base}.`} ${sentence}`
+}
+
 export function modelDisplayName(model: string): string {
   if (model === 'default') return 'Claude Default'
   if (model === 'sonnet') return 'Claude Sonnet'
@@ -302,11 +435,15 @@ export function modelDisplayName(model: string): string {
   return model
 }
 
+// model/list swaps this placeholder for Claude Code's own description of the
+// model once Claude Code has reported one.
+export const GENERIC_MODEL_DESCRIPTION = 'Claude Code runtime model'
+
 function modelDescription(model: string): string {
   if (model === 'opus-plan' || model === 'claude-opus-plan' || model === 'opusplan') {
     return 'Uses Opus in plan mode and Sonnet for execution; selecting this model does not enable plan mode.'
   }
-  return 'Claude Code runtime model'
+  return GENERIC_MODEL_DESCRIPTION
 }
 
 function scanDiscoveredRouterModels(): Set<string> {
@@ -369,6 +506,17 @@ export function claudeModelOptions(): Array<{
   description: string
   isDefault?: boolean
 }> {
+  // Model process profiles, when configured, are the whole picker.
+  const processProfiles = loadClaudeModelProfiles()
+  if (processProfiles.length > 0) {
+    return processProfiles.map((profile) => ({
+      id: profile.id,
+      sdkModel: profile.sdkModel,
+      displayName: profile.displayName,
+      description: profile.description,
+      isDefault: profile.isDefault,
+    }))
+  }
   const configured = process.env.CLAUDE_CODEX_MODELS
   if (configured) {
     try {
@@ -450,6 +598,8 @@ export function resolveClaudeModel(
   purpose: 'normal' | 'summary' = 'normal',
 ): string | null {
   const raw = (model ?? '').trim()
+  const processProfiles = loadClaudeModelProfiles()
+  if (processProfiles.length > 0) return resolveProfileModel(raw, purpose, processProfiles)
   if (purpose === 'summary') {
     const summaryModel =
       process.env.CLAUDE_CODEX_SUMMARY_MODEL || process.env.CLAUDE_CODEX_TITLE_MODEL || 'haiku'
@@ -491,6 +641,91 @@ export function resolveClaudeModel(
   return process.env.CLAUDE_CODEX_DEFAULT_MODEL || null
 }
 
+type ClaudeModelProfiles = ReturnType<typeof loadClaudeModelProfiles>
+
+function isDefaultModelAlias(raw: string): boolean {
+  return (
+    !raw ||
+    raw === 'default' ||
+    raw === 'claude-default' ||
+    raw === 'claude-code' ||
+    raw === 'custom'
+  )
+}
+
+function defaultModelProfile(profiles: ClaudeModelProfiles): ClaudeModelProfiles[number] | null {
+  return profiles.find((profile) => profile.isDefault) ?? profiles[0] ?? null
+}
+
+// The profile that answers summary turns (titles, compaction) of threads that
+// are not on a profile themselves.
+function summaryModelProfile(profiles: ClaudeModelProfiles): ClaudeModelProfiles[number] {
+  const summaryProfileId =
+    process.env.CLAUDE_CODEX_SUMMARY_MODEL ||
+    process.env.CLAUDE_CODEX_TITLE_MODEL ||
+    defaultModelProfile(profiles)?.id ||
+    ''
+  const profile = profiles.find((entry) => entry.id === summaryProfileId)
+  if (!profile) {
+    throw new Error(`unknown configured Claude summary model profile: ${summaryProfileId}`)
+  }
+  return profile
+}
+
+// With model process profiles configured, only profile ids (and the default
+// aliases) are Claude models; anything else is a configuration error rather
+// than a silent fallback to another provider.
+function resolveProfileModel(
+  raw: string,
+  purpose: 'normal' | 'summary',
+  profiles: ClaudeModelProfiles,
+): string | null {
+  if (purpose === 'summary' && (isCodexOpenAiModel(raw) || !raw)) {
+    return summaryModelProfile(profiles).sdkModel
+  }
+  const profile = profiles.find((entry) => entry.id === raw)
+  if (profile) return profile.sdkModel
+  if (isDefaultModelAlias(raw)) return defaultModelProfile(profiles)?.sdkModel ?? null
+  if (isCodexOpenAiModel(raw)) return raw
+  throw new Error(`unknown configured Claude model profile: ${raw}`)
+}
+
+// The model a summary turn runs on, plus the profile identity its process is
+// checked against. A thread on a profile keeps its pinned fingerprint; a
+// substitute profile (summary or default) is checked against its current one.
+export function resolveClaudeSummaryModelIdentity(
+  model: string | null | undefined,
+  pinnedProfileFingerprint: string | null = null,
+): {
+  model: string | null
+  modelProfileId: string | null
+  modelProfileFingerprint: string | null
+} {
+  const raw = (model ?? '').trim()
+  const processProfiles = loadClaudeModelProfiles()
+  const directProfile = processProfiles.find((profile) => profile.id === raw) ?? null
+  let profile = directProfile
+  if (!profile && processProfiles.length > 0) {
+    if (isCodexOpenAiModel(raw) || !raw) profile = summaryModelProfile(processProfiles)
+    else if (isDefaultModelAlias(raw)) profile = defaultModelProfile(processProfiles)
+  }
+  if (!profile) {
+    return {
+      model: resolveClaudeModel(model, 'summary'),
+      modelProfileId: null,
+      modelProfileFingerprint: null,
+    }
+  }
+  return {
+    model: profile.sdkModel,
+    modelProfileId: profile.id,
+    modelProfileFingerprint:
+      directProfile && pinnedProfileFingerprint
+        ? pinnedProfileFingerprint
+        : modelProfileFingerprint(profile.id),
+  }
+}
+
 export function defaultAllowedTools(): string[] | null {
   const raw = process.env.CLAUDE_CODEX_ALLOWED_TOOLS
   if (raw == null || raw.trim() === '') return null
@@ -506,15 +741,37 @@ export function claudeOutputFormat(outputSchema: unknown): unknown | null {
   if (outputSchema == null) return null
   if (outputSchema && typeof outputSchema === 'object' && !Array.isArray(outputSchema)) {
     const record = outputSchema as Record<string, unknown>
-    if (record.type === 'json_schema' && record.schema != null) return outputSchema
+    if (record.type === 'json_schema' && record.schema != null)
+      return { ...record, schema: withoutSchemaDialect(record.schema) }
   }
-  return { type: 'json_schema', schema: outputSchema }
+  return { type: 'json_schema', schema: withoutSchemaDialect(outputSchema) }
 }
 
+// The Claude CLI checks a structured output schema against the JSON Schema
+// draft it ships and refuses one that declares another, such as the draft
+// 2020-12 the Codex App's zod schemas declare. Those use nothing
+// draft-specific, so the declaration is dropped.
+// App rule: helper-thread-model
+function withoutSchemaDialect(schema: unknown): unknown {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema) || !('$schema' in schema))
+    return schema
+  const { $schema: _dialect, ...rest } = schema as Record<string, unknown>
+  return rest
+}
+
+// The efforts a thread or the config can hold. Only Claude models list 'max';
+// 'none' (a model without efforts) keeps whatever was set before.
 export function normalizeCodexReasoningEffort(
   value: string | null | undefined,
-): 'low' | 'medium' | 'high' | 'xhigh' | null {
-  if (value === 'low' || value === 'medium' || value === 'high' || value === 'xhigh') return value
+): 'low' | 'medium' | 'high' | 'xhigh' | 'max' | null {
+  if (
+    value === 'low' ||
+    value === 'medium' ||
+    value === 'high' ||
+    value === 'xhigh' ||
+    value === 'max'
+  )
+    return value
   if (value === 'minimal') return 'low'
   return null
 }
@@ -614,7 +871,9 @@ export function codexProxyModelOptions(): Array<{
       .map((s) => s.trim())
       .filter(Boolean)
   } else {
-    const catalogCandidates = [join(homedir(), '.codex/model_catalog.json')]
+    // The App and its bundled codex share CODEX_HOME, which is not ~/.codex
+    // for every install.
+    const catalogCandidates = [join(codexHome(), 'model_catalog.json')]
     for (const p of catalogCandidates) {
       if (existsSync(p)) {
         try {

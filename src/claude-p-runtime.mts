@@ -2,6 +2,9 @@ import { type ChildProcess, execFileSync, spawn } from 'node:child_process'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { autoCompactWindowEnv } from './auto-compact.mjs'
+import { autoMemoryEnv } from './memories.mjs'
+import { flatPrompt } from './turn-context.mjs'
 import type { ClaudeRuntime, RuntimeHandlers, RuntimeTurnContext } from './types.mjs'
 
 export interface ClaudePRuntimeOptions {
@@ -26,7 +29,7 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
   async runTurn(context: RuntimeTurnContext, handlers: RuntimeHandlers): Promise<void> {
     const tmp = await mkdtemp(join(tmpdir(), 'claude-codex-claude-p-'))
     const inputFile = join(tmp, 'prompt.txt')
-    await writeFile(inputFile, context.prompt, 'utf8')
+    await writeFile(inputFile, flatPrompt(context.prompt, context.promptContext), 'utf8')
 
     try {
       if (context.imageInputs.length > 0) {
@@ -39,7 +42,21 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
       }
 
       const args = this.argsForContext(context, inputFile)
-      const result = await this.runProcessWithRetry(context.threadId, args, context.cwd, handlers)
+      // With the memories mapping on, auto-memory only for threads the user
+      // turned memories on for; Codex's compaction limit, when set, as the
+      // window.
+      const env = {
+        ...process.env,
+        ...autoMemoryEnv(context.autoMemory),
+        ...autoCompactWindowEnv(context.autoCompactWindow),
+      }
+      const result = await this.runProcessWithRetry(
+        context.threadId,
+        args,
+        context.cwd,
+        env,
+        handlers,
+      )
       const parsed = parseClaudePJson(result.stdout)
       const text = parsed?.result ?? result.stdout.trim()
       const sessionId = parsed?.sessionId
@@ -67,7 +84,7 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
     }
   }
 
-  async steer(): Promise<void> {
+  async steer(): Promise<undefined> {
     throw new Error('claude-p runtime does not support turn/steer; start a new turn instead')
   }
 
@@ -102,9 +119,14 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
     // still emit the previous assistant result in stdout, so keep resume
     // opt-in until that upstream behavior is stable.
     const resume = this.options.resume ? claudePResumeId(context.claudeSessionId) : null
-    if (resume && !context.forkSession) args.push('--resume', resume)
+    if (resume && !context.forkSession && !context.resumeSessionAt) args.push('--resume', resume)
     const allowedTools = allowedToolsForContext(context)
     if (allowedTools) args.push('--allowedTools', allowedTools)
+    // The tools the thread must not have (WebSearch with web search off,
+    // permission deny rules, MCP tools the config disables), as the SDK
+    // route passes them; claude-p hands the flag on to Claude Code.
+    if (context.disallowedTools && context.disallowedTools.length > 0)
+      args.push('--disallowedTools', context.disallowedTools.join(','))
     if (
       this.options.skipPermissions ||
       context.approvalPolicy === 'never' ||
@@ -120,10 +142,11 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
     threadId: string,
     args: string[],
     cwd: string,
+    env: NodeJS.ProcessEnv,
   ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
     const child = spawn(this.options.command, args, {
       cwd,
-      env: { ...process.env },
+      env,
       stdio: ['ignore', 'pipe', 'pipe'],
       detached: process.platform !== 'win32',
     })
@@ -173,6 +196,7 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
     threadId: string,
     args: string[],
     cwd: string,
+    env: NodeJS.ProcessEnv,
     handlers: RuntimeHandlers,
   ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
     const attempts = 1 + Math.max(0, this.options.stopTimeoutRetries ?? 0)
@@ -180,7 +204,7 @@ export class ClaudePTranscriptRuntime implements ClaudeRuntime {
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
       let result: { stdout: string; stderr: string; exitCode: number }
       try {
-        result = await this.runProcess(threadId, args, cwd)
+        result = await this.runProcess(threadId, args, cwd, env)
       } catch (error) {
         if (isClaudePTimeoutError(error) && attempt < attempts) {
           await handlers.onEvent({
@@ -302,10 +326,12 @@ function parseClaudePJson(stdout: string): ParsedClaudePResult | null {
 }
 
 function allowedToolsForContext(context: RuntimeTurnContext): string | null {
-  if (context.sandboxMode === 'read-only') return READ_ONLY_TOOLS.join(',')
-  return context.allowedTools && context.allowedTools.length > 0
-    ? context.allowedTools.join(',')
-    : null
+  // A tool the thread must not have is not pre-approved either.
+  const denied = new Set(context.disallowedTools ?? [])
+  const tools = (
+    context.sandboxMode === 'read-only' ? READ_ONLY_TOOLS : (context.allowedTools ?? [])
+  ).filter((tool) => !denied.has(tool))
+  return tools.length > 0 ? tools.join(',') : null
 }
 
 function claudePResumeId(value: string | null): string | null {

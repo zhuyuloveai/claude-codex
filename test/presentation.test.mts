@@ -4,11 +4,19 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { CodexClaudeAppServer } from '../src/server.mjs'
+import {
+  codexErrorInfo,
+  parseSubagentTrailer,
+  retryTurnError,
+  turnErrorOf,
+  turnFailure,
+} from '../src/server-helpers.mjs'
 import { SessionStore } from '../src/store.mjs'
 import type {
   ClaudeRuntime,
   RpcPeer,
   RuntimeEvent,
+  RuntimeFailure,
   RuntimeHandlers,
   ThreadItem,
   WireMessage,
@@ -17,7 +25,7 @@ import type {
 type CapturedMessage = { method?: string; id?: unknown; params?: any; result?: any; error?: any }
 
 async function present(
-  run: (handlers: RuntimeHandlers) => Promise<void>,
+  run: (handlers: RuntimeHandlers, turn: { interrupt: () => Promise<void> }) => Promise<void>,
   params: Record<string, unknown> = {},
 ) {
   const directory = await mkdtemp(join(tmpdir(), 'claude-presentation-'))
@@ -30,7 +38,15 @@ async function present(
     finish = resolve
   })
   const runtime: ClaudeRuntime = {
-    runTurn: async (_context, handlers) => run(handlers),
+    runTurn: async (context, handlers) =>
+      run(handlers, {
+        interrupt: () =>
+          server.handle(peer, {
+            id: 9,
+            method: 'turn/interrupt',
+            params: { threadId: context.threadId },
+          }) as Promise<void>,
+      }),
     steer: async () => {},
     interrupt: async () => {},
     stop: async () => {},
@@ -119,7 +135,7 @@ test('progress, tools and final Markdown remain separate in streaming and replay
   )
   assert.deepEqual(
     turn.items.map((item) => item.type),
-    ['userMessage', 'agentMessage', 'mcpToolCall', 'agentMessage'],
+    ['userMessage', 'agentMessage', 'commandExecution', 'agentMessage'],
   )
   assert.deepEqual(
     assistantItems(turn.items).map(({ text, phase }) => ({ text, phase })),
@@ -133,7 +149,7 @@ test('progress, tools and final Markdown remain separate in streaming and replay
     .map((message) => message.params.item)
   assert.deepEqual(
     completedItems.map((item) => item.type),
-    ['agentMessage', 'mcpToolCall', 'agentMessage'],
+    ['agentMessage', 'commandExecution', 'agentMessage'],
   )
   assert.equal(new Set(completedItems.map((item) => item.id)).size, completedItems.length)
   assert.deepEqual(replay.items, turn.items)
@@ -237,12 +253,18 @@ test('reasoning appears once and completes before visible prose', async () => {
       { type: 'text_delta', delta: 'Answer.' },
     ]),
   )
-  const reasoning = turn.items.find((item) => item.type === 'reasoning')
-  assert.equal(reasoning?.type, 'reasoning')
-  assert.deepEqual(reasoning.summary, [])
-  assert.deepEqual(reasoning.content, ['Think carefully.'])
+  // The App renders reasoning from its summary alone.
+  const reasoning = turn.items.flatMap((item) => (item.type === 'reasoning' ? [item] : []))
+  assert.deepEqual(
+    reasoning.map((item) => [item.summary, item.content]),
+    [[['Think carefully.'], []]],
+  )
   assert.equal(
-    messages.some((message) => message.method === 'item/reasoning/summaryTextDelta'),
+    messages.filter((message) => message.method === 'item/reasoning/summaryPartAdded').length,
+    1,
+  )
+  assert.equal(
+    messages.some((message) => message.method === 'item/reasoning/textDelta'),
     false,
   )
   const reasoningDone = messages.findIndex(
@@ -254,15 +276,15 @@ test('reasoning appears once and completes before visible prose', async () => {
   assert.ok(reasoningDone >= 0 && answerStart > reasoningDone)
 })
 
-test('hooks, approval and user questions retain their structured timeline items', async () => {
+test('approval and user questions retain their structured timeline items around hook runs', async () => {
   const { messages, turn } = await present(async (handlers) => {
     await handlers.onEvent({ type: 'text_delta', delta: 'Before hook.' })
     await handlers.onEvent({
-      type: 'hook',
-      hookName: 'PreToolUse',
-      status: 'done',
-      decision: null,
-      message: 'Checked',
+      type: 'hook_run',
+      hookId: 'pre',
+      hookEvent: 'PreToolUse',
+      status: 'completed',
+      entries: [],
     })
     await handlers.onEvent({ type: 'message_boundary' })
     await handlers.onEvent({ type: 'text_delta', delta: 'Before approval.' })
@@ -297,7 +319,6 @@ test('hooks, approval and user questions retain their structured timeline items'
     [
       'userMessage',
       'agentMessage',
-      'hookPrompt',
       'agentMessage',
       'commandExecution',
       'agentMessage',
@@ -321,10 +342,10 @@ test('hook telemetry and duplicate tools do not split a final Markdown response'
       { type: 'tool_use', toolUseId: 'read', toolName: 'Read', input: { file_path: 'app.ts' } },
       { type: 'tool_result', toolUseId: 'read', content: 'file content' },
       { type: 'text_delta', delta: '**Final' },
-      { type: 'hook', hookName: 'Stop', status: 'done', decision: null, message: null },
+      { type: 'hook_run', hookId: 'stop', hookEvent: 'Stop', status: 'completed', entries: [] },
       { type: 'tool_use', toolUseId: 'read', toolName: 'Read', input: { file_path: 'app.ts' } },
       { type: 'text_delta', delta: ' answer**' },
-      { type: 'hook', hookName: 'Stop', status: 'done', decision: null, message: null },
+      { type: 'hook_run', hookId: 'stop', hookEvent: 'Stop', status: 'completed', entries: [] },
       { type: 'completed', success: true },
     ]),
   )
@@ -355,21 +376,457 @@ test('failed partial messages are completed as commentary, never final answers',
   assert.equal(turn.status, 'failed')
   assert.equal(assistantItems(turn.items)[0]?.phase, 'commentary')
   assert.equal(messages.filter((message) => message.method === 'item/completed').length, 1)
+  // An error with no Codex code is 'other', as Codex reports one.
+  const expected = { message: 'Connection lost', codexErrorInfo: 'other', additionalDetails: null }
+  assert.deepEqual(turn.error, expected)
+  assert.deepEqual(
+    messages.filter((message) => message.method === 'error').map((message) => message.params),
+    [{ threadId: turn.threadId, turnId: turn.id, willRetry: false, error: expected }],
+  )
 })
 
-test('plan output retains its native plan item and complete Markdown', async () => {
-  const { turn, messages } = await present(
+test('Claude failures map onto the Codex error codes the App knows', () => {
+  const failure = (fields: Partial<RuntimeFailure>): RuntimeFailure => ({
+    terminalReason: 'api_error',
+    category: null,
+    status: null,
+    ...fields,
+  })
+  const cases: Array<[RuntimeFailure | null, unknown]> = [
+    [
+      failure({ terminalReason: 'prompt_too_long', category: 'invalid_request', status: 400 }),
+      'contextWindowExceeded',
+    ],
+    [failure({ category: 'overloaded', status: 529 }), 'serverOverloaded'],
+    [failure({ status: 529 }), 'serverOverloaded'],
+    [failure({ category: 'rate_limit', status: 429 }), 'rateLimitExceeded'],
+    [failure({ category: 'invalid_request', status: 400 }), 'badRequest'],
+    [failure({ category: 'server_error', status: 500 }), 'internalServerError'],
+    [failure({ status: 503 }), 'internalServerError'],
+    [failure({}), { httpConnectionFailed: { httpStatusCode: null } }],
+    [failure({ category: 'unknown' }), { httpConnectionFailed: { httpStatusCode: null } }],
+    // The App answers these codes with ChatGPT account flows.
+    [failure({ category: 'authentication_failed', status: 401 }), 'other'],
+    [failure({ category: 'billing_error', status: 402 }), 'other'],
+    [failure({ terminalReason: 'max_turns' }), 'other'],
+    [null, 'other'],
+  ]
+  for (const [input, code] of cases) {
+    assert.deepEqual(codexErrorInfo(input), code, JSON.stringify(input))
+  }
+  // A retry is a disconnected stream, as Codex reports every stream retry,
+  // except an overloaded API, which the App shows as a busy server.
+  assert.deepEqual(codexErrorInfo(failure({ category: 'server_error', status: 500 }), true), {
+    responseStreamDisconnected: { httpStatusCode: 500 },
+  })
+  assert.deepEqual(codexErrorInfo(failure({ category: 'rate_limit', status: 429 }), true), {
+    responseStreamDisconnected: { httpStatusCode: 429 },
+  })
+  assert.equal(
+    codexErrorInfo(failure({ category: 'overloaded', status: 529 }), true),
+    'serverOverloaded',
+  )
+  assert.deepEqual(
+    retryTurnError({
+      type: 'retrying',
+      attempt: 3,
+      maxRetries: 10,
+      status: 500,
+      category: 'server_error',
+      delayMs: 4_400,
+    }),
+    {
+      message: 'Reconnecting... 3/10',
+      codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: 500 } },
+      additionalDetails: 'HTTP 500 server error; retrying in 4s',
+    },
+  )
+})
+
+test('a CLI that refused to start says why, offers a retry only when one can help, and hides its own text', () => {
+  const startup = (startupFailure: string): RuntimeFailure => ({
+    terminalReason: null,
+    category: null,
+    status: null,
+    startupFailure,
+  })
+  const retryable = { httpConnectionFailed: { httpStatusCode: null } }
+  const cases: Array<[string, unknown, RegExp]> = [
+    // Something could not be loaded or checked right now.
+    ['org_config_required_unavailable', retryable, /policy limits.*try again/],
+    ['remote_settings_required_unavailable', retryable, /managed settings.*try again/],
+    ['org_verify_failed', retryable, /verify/],
+    ['worktree_unverified', retryable, /worktree/],
+    // A new sign-in or an administrator: a retry does not help.
+    ['org_config_refused', 'other', /refused.*claude \/login/],
+    ['gateway_signin_required', 'other', /claude \/login/],
+    ['gateway_access_denied', 'other', /administrator/],
+    ['org_pin_api_key_conflict', 'other', /API key/],
+    ['org_pin_mismatch', 'other', /allowed account/],
+    ['provider_not_allowed', 'other', /provider/],
+    ['managed_settings_invalid', 'other', /managed settings/],
+    // Something on this machine to fix first.
+    ['proxy_invalid', 'other', /proxy/],
+    ['temp_dir_unusable', 'other', /temporary directory/],
+    ['cwd_unavailable', 'other', /working directory/],
+    ['shell_tool_missing', 'other', /shell/],
+    ['session_held_by_background', 'other', /background session/],
+    ['worktree_resume_refused', 'other', /resume/],
+    ['cli_version_too_old', 'other', /Update Claude Code/],
+    ['bypass_root', 'other', /root/],
+    // A reason newer than the adapter.
+    ['brand_new_reason', 'other', /^Claude Code refused to start \(brand_new_reason\)\.$/],
+  ]
+  for (const [reason, code, message] of cases) {
+    assert.deepEqual(codexErrorInfo(startup(reason)), code, reason)
+    // A refused start is never a retry the CLI itself makes.
+    assert.deepEqual(codexErrorInfo(startup(reason), true), code, reason)
+    const raw = 'Invalid proxy URL: http://user:secret@proxy.invalid:8080 (sk-ant-api03-key)'
+    const error = turnErrorOf(turnFailure(raw, startup(reason)))
+    assert.match(error.message, message, reason)
+    assert.deepEqual(error.codexErrorInfo, code, reason)
+    assert.equal(error.additionalDetails, `Claude Code startup failure: ${reason}`)
+    assert.doesNotMatch(JSON.stringify(error), /secret|sk-ant|proxy\.invalid/, reason)
+  }
+  // A reason that does not look like one is not repeated.
+  const odd = turnErrorOf(turnFailure('raw', startup('Bearer abc.def')))
+  assert.deepEqual(odd, {
+    message: 'Claude Code refused to start.',
+    codexErrorInfo: 'other',
+    additionalDetails: null,
+  })
+  // Inherited keys are no reasons.
+  assert.equal(turnErrorOf(turnFailure('raw', startup('constructor'))).codexErrorInfo, 'other')
+  // A failure without a startup reason keeps its own message.
+  assert.equal(
+    turnErrorOf(
+      turnFailure('API Error: 500', {
+        terminalReason: 'api_error',
+        category: 'server_error',
+        status: 500,
+      }),
+    ).message,
+    'API Error: 500',
+  )
+})
+
+test('retries show as passing Reconnecting errors in chats, not in helper turns', async () => {
+  const retrying: RuntimeEvent[] = [
+    {
+      type: 'retrying',
+      attempt: 1,
+      maxRetries: 10,
+      status: 429,
+      category: 'rate_limit',
+      delayMs: 600,
+    },
+    { type: 'text_delta', delta: '{"result":"ok"}' },
+  ]
+  const chat = await present(emit(retrying))
+  assert.equal(chat.turn.status, 'completed')
+  assert.deepEqual(
+    chat.messages.filter((message) => message.method === 'error').map((message) => message.params),
+    [
+      {
+        threadId: chat.turn.threadId,
+        turnId: chat.turn.id,
+        willRetry: true,
+        error: {
+          message: 'Reconnecting... 1/10',
+          codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: 429 } },
+          additionalDetails: 'HTTP 429 rate limit; retrying in 1s',
+        },
+      },
+    ],
+  )
+  assert.equal(chat.turn.error, null)
+  assert.equal(
+    chat.replay.items.some((item: { type: string }) => item.type === 'error'),
+    false,
+  )
+
+  const helper = await present(emit(retrying), {
+    outputSchema: { type: 'object', properties: { result: { type: 'string' } } },
+  })
+  assert.equal(helper.turn.status, 'completed')
+  assert.equal(helper.messages.filter((message) => message.method === 'error').length, 0)
+})
+
+test('plan mode: the ExitPlanMode plan is the one plan item, prose stays agent messages', async () => {
+  const plan = '## Plan\n\n1. Inspect\n2. Implement'
+  const { turn, messages, replay } = await present(
     emit([
       { type: 'message_boundary' },
-      { type: 'text_delta', delta: '## Plan\n\n' },
-      { type: 'text_delta', delta: '1. Inspect\n2. Implement' },
+      { type: 'text_delta', delta: 'I looked around.' },
+      { type: 'tool_use', toolUseId: 'exit-1', toolName: 'ExitPlanMode', input: { plan } },
+      { type: 'proposed_plan', toolUseId: 'exit-1', text: plan },
+      { type: 'tool_result', toolUseId: 'exit-1', content: 'delivered', isError: true },
+      { type: 'text_delta', delta: 'Plan ready.' },
+      { type: 'completed', success: true },
+    ]),
+    { planMode: true },
+  )
+  assert.equal(turn.status, 'completed')
+  const shown = turn.items.filter((item) => item.type !== 'userMessage')
+  assert.deepEqual(
+    shown.map((item) => item.type),
+    ['agentMessage', 'plan', 'agentMessage'],
+    'ExitPlanMode is the card, not a tool item',
+  )
+  assert.deepEqual(
+    shown.map((item) => (item as { text: string }).text),
+    ['I looked around.', plan, 'Plan ready.'],
+  )
+  assert.equal(assistantItems(turn.items).at(-1)?.phase, 'final_answer')
+  const planEvents = messages
+    .filter(
+      (message) => message.params?.item?.type === 'plan' || message.method?.startsWith('item/plan'),
+    )
+    .map((message) => [message.method, message.params.item?.text ?? message.params.delta])
+  assert.deepEqual(planEvents, [
+    ['item/started', ''],
+    ['item/plan/delta', plan],
+    ['item/completed', plan],
+  ])
+  assert.deepEqual(
+    replay.items.filter((item: ThreadItem) => item.type === 'plan').map((item: any) => item.text),
+    [plan],
+  )
+})
+
+test('a plan revised in the same turn replaces its card', async () => {
+  const { turn, messages } = await present(
+    emit([
+      { type: 'proposed_plan', toolUseId: 'exit-1', text: '1. First draft' },
+      { type: 'proposed_plan', toolUseId: 'exit-2', text: '1. Final plan' },
       { type: 'completed', success: true },
     ]),
     { planMode: true },
   )
   const plans = turn.items.filter((item) => item.type === 'plan')
-  assert.equal(plans.length, 1)
-  assert.equal(plans[0]?.text, '## Plan\n\n1. Inspect\n2. Implement')
-  assert.equal(assistantItems(turn.items).length, 0)
-  assert.equal(messages.filter((message) => message.method === 'item/completed').length, 1)
+  assert.deepEqual(
+    plans.map((item) => item.text),
+    ['1. Final plan'],
+  )
+  const completedPlans = messages.filter(
+    (message) => message.method === 'item/completed' && message.params.item.type === 'plan',
+  )
+  assert.equal(new Set(completedPlans.map((message) => message.params.item.id)).size, 1)
+  assert.equal(completedPlans.at(-1)?.params.item.text, '1. Final plan')
+})
+
+test('an interrupt completes the message still streaming before the turn', async () => {
+  // Plan mode streams prose as an agent message too; only ExitPlanMode
+  // makes a plan item.
+  for (const planMode of [false, true]) {
+    const { messages, turn, replay } = await present(
+      async (handlers, { interrupt }) => {
+        await handlers.onEvent({ type: 'text_delta', delta: 'Started the workflow.' })
+        await interrupt()
+      },
+      { planMode },
+    )
+    assert.equal(turn.status, 'interrupted')
+    const order = messages
+      .filter(
+        (message) => message.method === 'item/completed' || message.method === 'turn/completed',
+      )
+      .map((message) => message.params.item?.type ?? message.method)
+    assert.deepEqual(order, ['agentMessage', 'turn/completed'])
+    const live = messages.find((message) => message.method === 'item/completed')?.params.item
+    assert.equal(live.text, 'Started the workflow.')
+    assert.deepEqual(
+      replay.items.find((item: ThreadItem) => item.type === 'agentMessage'),
+      live,
+    )
+  }
+})
+
+test('a turn that ends early fails the tool calls still running before the turn', async () => {
+  for (const ending of ['interrupt', 'error'] as const) {
+    const { messages, turn, replay } = await present(async (handlers, { interrupt }) => {
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId: 'sleep',
+        toolName: 'Bash',
+        input: { command: 'sleep 10' },
+      })
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId: 'read',
+        toolName: 'Read',
+        input: { file_path: 'notes.md' },
+      })
+      await handlers.onEvent({ type: 'tool_result', toolUseId: 'read', content: 'notes' })
+      if (ending === 'error') throw new Error('Claude exited')
+      await interrupt()
+      // The result that arrives after the interrupt is dropped.
+      await handlers.onEvent({ type: 'tool_result', toolUseId: 'sleep', content: 'late' })
+    })
+    assert.equal(turn.status, ending === 'interrupt' ? 'interrupted' : 'failed')
+    const order = messages
+      .filter(
+        (message) => message.method === 'item/completed' || message.method === 'turn/completed',
+      )
+      .map((message) =>
+        message.params.item
+          ? `${message.params.item.type}:${message.params.item.status}`
+          : message.method,
+      )
+    assert.deepEqual(order, [
+      'commandExecution:completed',
+      'commandExecution:failed',
+      'turn/completed',
+    ])
+    const live = messages.find(
+      (message) =>
+        message.method === 'item/completed' && message.params.item.command === 'sleep 10',
+    )?.params.item
+    assert.equal(live.exitCode, null)
+    assert.equal(typeof live.durationMs, 'number')
+    assert.deepEqual(
+      replay.items.find(
+        (item: ThreadItem) => item.type === 'commandExecution' && item.command === 'sleep 10',
+      ),
+      live,
+    )
+  }
+})
+
+test('an image Read asks about and falls back to its Read command', async () => {
+  const image = [
+    { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBORw0K' } },
+  ]
+  let decision: string | null = null
+  const { messages, turn, replay } = await present(
+    async (handlers, { interrupt }) => {
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId: 'asked',
+        toolName: 'Read',
+        input: { file_path: '/elsewhere/chart.png' },
+      })
+      decision = (
+        await handlers.onPermissionRequest({
+          type: 'permission_request',
+          requestId: 'perm-asked',
+          toolUseId: 'asked',
+          toolName: 'Read',
+          input: { file_path: '/elsewhere/chart.png' },
+        })
+      ).decision
+      await handlers.onEvent({ type: 'tool_result', toolUseId: 'asked', content: image })
+      await handlers.onEvent({
+        type: 'tool_use',
+        toolUseId: 'open',
+        toolName: 'Read',
+        input: { file_path: 'late.png' },
+      })
+      await interrupt()
+    },
+    // Full access, the default, would accept without asking.
+    { sandbox: 'workspace-write' },
+  )
+  assert.equal(decision, 'accept')
+  const cwd = messages.find((message) => message.id === 1)?.result.thread.cwd
+  const started = messages
+    .filter((message) => message.method === 'item/started')
+    .map((message) => message.params.item)
+    .filter((item) => item.type !== 'userMessage')
+  assert.deepEqual(
+    started.map(({ type, path }) => ({ type, path })),
+    [
+      { type: 'imageView', path: '/elsewhere/chart.png' },
+      { type: 'imageView', path: join(cwd, 'late.png') },
+    ],
+  )
+  // The App asks about the Read on the command card, as for a command.
+  const request = messages.find(
+    (message) => message.method === 'item/commandExecution/requestApproval',
+  )?.params
+  assert.deepEqual(
+    {
+      itemId: request?.itemId,
+      command: request?.command,
+      cwd: request?.cwd,
+      commandActions: request?.commandActions,
+      availableDecisions: request?.availableDecisions,
+    },
+    {
+      itemId: started[0].id,
+      command: 'Read /elsewhere/chart.png',
+      cwd,
+      commandActions: [
+        {
+          type: 'read',
+          command: 'Read /elsewhere/chart.png',
+          name: 'chart.png',
+          path: '/elsewhere/chart.png',
+        },
+      ],
+      availableDecisions: ['accept', 'acceptForSession', 'decline', 'cancel'],
+    },
+  )
+  const completed = messages
+    .filter((message) => message.method === 'item/completed')
+    .map((message) => message.params.item)
+  assert.deepEqual(completed[0], {
+    type: 'imageView',
+    id: started[0].id,
+    path: '/elsewhere/chart.png',
+  })
+  // The image a stopped Read never showed is the Read that failed.
+  assert.deepEqual(
+    {
+      id: completed[1].id,
+      type: completed[1].type,
+      command: completed[1].command,
+      status: completed[1].status,
+      aggregatedOutput: completed[1].aggregatedOutput,
+      exitCode: completed[1].exitCode,
+    },
+    {
+      id: started[1].id,
+      type: 'commandExecution',
+      command: 'Read late.png',
+      status: 'failed',
+      aggregatedOutput: null,
+      exitCode: null,
+    },
+  )
+  assert.equal(turn.status, 'interrupted')
+  assert.deepEqual(replay.items, turn.items)
+})
+
+test('subagent results keep only the report, in both CLI trailer formats', () => {
+  const legacy = parseSubagentTrailer(
+    "found it\nagentId: a1b2c3d4e5f6a7b8 (use SendMessage with to: 'a1b2c3d4e5f6a7b8' to continue this agent)\n<usage>total_tokens: 12\ntool_uses: 1\nduration_ms: 3</usage>",
+  )
+  assert.deepEqual(legacy, {
+    cleanText: 'found it',
+    agentId: 'a1b2c3d4e5f6a7b8',
+    usage: { totalTokens: 12, toolUses: 1, durationMs: 3 },
+  })
+
+  const framed = parseSubagentTrailer(
+    [
+      '  SECURITY WARNING: a note for the parent model.',
+      '[Subagent hand-back] The text below is the final report of a subagent. The report follows:',
+      '  Done.',
+      '  [Subagent hand-back] quoted by the agent, so it stays',
+      '  ',
+      '    nested indent',
+      "agentId: aef61b963198d372e (use SendMessage with to: 'aef61b963198d372e', summary: '<5-10 word recap>' to continue this agent)",
+      'worktreePath: /tmp/wt',
+      'worktreeBranch: agent-wt',
+      '<usage>subagent_tokens: 18437',
+      'tool_uses: 1',
+      'duration_ms: 97082</usage>',
+    ].join('\n'),
+  )
+  assert.deepEqual(framed, {
+    cleanText: 'Done.\n[Subagent hand-back] quoted by the agent, so it stays\n\n  nested indent',
+    agentId: 'aef61b963198d372e',
+    usage: { totalTokens: 18437, toolUses: 1, durationMs: 97082 },
+  })
 })

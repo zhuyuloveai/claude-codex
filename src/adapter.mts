@@ -2,18 +2,25 @@
 import { spawn } from 'node:child_process'
 import { chmodSync, existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
+import { APP_PLUGIN_SERVER_ENV, setAppPluginConfigOverrides } from './app-plugin-mcp.mjs'
+import { sweepCliMcpConfigs } from './cli-mcp-config.mjs'
+import { reapOrphanedCliChildren } from './cli-orphans.mjs'
+import { daemonProbe, startupConfigProbe } from './cli-probes.mjs'
+import { inheritedHooksWarning } from './inherited-config.mjs'
 import { createRuntime } from './runtime-factory.mjs'
 import { CodexClaudeAppServer } from './server.mjs'
 import { SessionStore } from './store.mjs'
 import {
   normalizeListenUrl,
   parseProxySockArg,
+  prepareWebSocketAuth,
+  type RunningTransport,
   runProxy,
   startStdioTransport,
   startWebSocketTransport,
 } from './transports.mjs'
 import type { RpcPeer } from './types.mjs'
-import { debugLog, defaultSocketPath, ensureParent } from './util.mjs'
+import { debugLog, defaultSocketPath, ensureParent, sleep } from './util.mjs'
 
 // Install global crash guards FIRST, before anything else can fail. Without
 // these, a single uncaught rejection or a synchronous EPIPE from a write to a
@@ -58,6 +65,28 @@ async function main(): Promise<void> {
     return
   }
 
+  // One-shot probes, answered before the state database opens and before
+  // startup recovery, so a probe cannot disturb a server already running.
+  const probe = startupConfigProbe(args) ?? (await daemonProbe(args))
+  if (probe) {
+    process.stdout.write(probe.stdout)
+    process.stderr.write(probe.stderr)
+    process.exitCode = probe.code
+    return
+  }
+
+  // An App plugin server the adapter runs may itself run `codex app-server`
+  // (the code-review plugin does, for the Codex sign-in). Through the shim
+  // that would start a second adapter on the same state, which would take
+  // the running turns of this one for stale ones, or connect to this one.
+  // App rule: code-review-plugin-server
+  if (process.env[APP_PLUGIN_SERVER_ENV] === '1') {
+    process.stderr.write(
+      '[claude-codex-adapter] not started: App plugin servers cannot run the app-server\n',
+    )
+    process.exit(1)
+  }
+
   const proxyIndex = args.indexOf('proxy')
   if (proxyIndex >= 0) {
     await runProxy(parseProxySockArg(args.slice(proxyIndex + 1)))
@@ -71,6 +100,29 @@ async function main(): Promise<void> {
 
   const listen = getArg(args, '--listen') ?? 'stdio://'
   if (listen === 'off') return
+  const wsAuth = {
+    auth: getArg(args, '--ws-auth'),
+    tokenFile: getArg(args, '--ws-token-file'),
+    tokenSha256: getArg(args, '--ws-token-sha256'),
+    allowedOrigins: getArg(args, '--ws-allowed-origins'),
+  }
+  const allowUnauthenticated = args.includes('--ws-allow-unauthenticated')
+  // Before anything else starts, so a listener that would be unprotected
+  // fails without touching the store or other processes.
+  const preparedWsAuth = checkOptions(() => {
+    if (
+      !listen.startsWith('ws://') &&
+      (allowUnauthenticated || Object.values(wsAuth).some((value) => value !== null))
+    ) {
+      throw new Error(
+        '--ws-auth, --ws-token-file, --ws-token-sha256, --ws-allowed-origins and --ws-allow-unauthenticated need --listen ws://',
+      )
+    }
+    return prepareWebSocketAuth(normalizeListenUrl(listen), { ...wsAuth, allowUnauthenticated })
+  })
+  // The App passes -c settings for the Codex config, the plugin servers it
+  // wants among them.
+  setAppPluginConfigOverrides(configArgs(args))
   const isUnixDaemon = listen.startsWith('unix://')
   // The SSH bootstrap used by Codex App backgrounds an AND-list whose final
   // command is `codex app-server --listen unix://`. That shell still waits for
@@ -96,29 +148,67 @@ async function main(): Promise<void> {
   }
 
   const store = new SessionStore()
-  // Codex cc normally launches the app-server over stdio, so a crashed or
+  // The Codex App normally launches the app-server over stdio, so a crashed or
   // force-quit adapter leaves its last turn persisted as `inProgress`. The
   // next stdio process is the recovery boundary just like the unix daemon;
   // only recovering unix transports leaves the App's subagent view stuck on
   // "loading" forever after a restart.
   const recovered = store.recoverStaleInProgressTurns()
   if (recovered > 0) {
-    process.stderr.write(`[chrys-codex-adapter] recovered ${recovered} stale in-progress turn(s)\n`)
+    process.stderr.write(
+      `[claude-codex-adapter] recovered ${recovered} stale in-progress turn(s)\n`,
+    )
+  }
+  // Same boundary for processes: a killed adapter's CLI keeps writing the
+  // session this process may resume, so stop it before serving.
+  const reaped = await reapOrphanedCliChildren()
+  if (reaped.length > 0) {
+    process.stderr.write(
+      `[claude-codex-adapter] stopped ${reaped.length} orphaned Claude CLI process(es)\n`,
+    )
+  }
+  // And the MCP config files a killed adapter left for its CLI sessions.
+  sweepCliMcpConfigs()
+  // Bridged hooks run twice under a CLI that reads its own settings files.
+  const hooksWarning = inheritedHooksWarning()
+  if (hooksWarning) {
+    debugLog('adapter.inheritedHooksWarning', { cli: Boolean(process.env.CLAUDE_CODEX_CLI) })
+    process.stderr.write(`[claude-codex-adapter] ${hooksWarning}\n`)
   }
   const runtime = createRuntime()
   const server = new CodexClaudeAppServer(store, runtime)
+  let transport: RunningTransport | null = null
   let shuttingDown = false
   const shutdown = async (reason: string) => {
     if (shuttingDown) return
     shuttingDown = true
     debugLog('adapter.shutdown', { reason, pid: process.pid })
-    await server.stop()
+    let code = 0
+    try {
+      // The CLI record stays: a SIGTERMed CLI does not always exit with the
+      // adapter, and the next adapter reaps whatever is left.
+      await server.stop()
+    } catch (error) {
+      // shuttingDown already ignores the next signal, so a failed stop has to
+      // end the process here or nothing will.
+      code = 1
+      const message = error instanceof Error ? error.message : String(error)
+      debugLog('adapter.shutdown.failed', { reason, pid: process.pid, message })
+      process.stderr.write(`[claude-codex-adapter] shutdown failed: ${message}\n`)
+    }
+    try {
+      // Closing the listener removes its unix socket if no other process has
+      // bound the path since. Bounded, so a close that hangs cannot keep the
+      // process from exiting.
+      await Promise.race([transport?.close(), sleep(2000)])
+    } catch {}
     if (pidFile) {
       try {
-        unlinkSync(pidFile)
+        // Ours only, like the socket.
+        if (Number(readFileSync(pidFile, 'utf8')) === process.pid) unlinkSync(pidFile)
       } catch {}
     }
-    process.exit(0)
+    process.exit(code)
   }
   process.once('SIGINT', () => void shutdown('SIGINT'))
   process.once('SIGTERM', () => void shutdown('SIGTERM'))
@@ -158,7 +248,7 @@ async function main(): Promise<void> {
     idleTimer = setTimeout(() => {
       debugLog('adapter.idleExit', { idleExitMs, pid: process.pid })
       process.stderr.write(
-        `[chrys-codex-adapter] no active peers for ${idleExitMs}ms, shutting down\n`,
+        `[claude-codex-adapter] no active peers for ${idleExitMs}ms, shutting down\n`,
       )
       void shutdown('idleExit')
     }, idleExitMs)
@@ -188,9 +278,23 @@ async function main(): Promise<void> {
     startStdioTransport(onMessage, onClose)
     return
   }
-  await startWebSocketTransport(normalized, onMessage, onClose, onConnect)
-  if (isUnixDaemon && typeof process.send === 'function') {
+  transport = await startWebSocketTransport(normalized, onMessage, onClose, onConnect, {
+    ...(preparedWsAuth ? { auth: preparedWsAuth } : {}),
+  })
+  if (isUnixDaemon && typeof process.send === 'function')
     process.send({ type: 'chrys-codex-ready' })
+}
+
+// A bad option ends the process with its message alone, like the usage text:
+// a stack trace would read as a crash.
+function checkOptions<T>(check: () => T): T {
+  try {
+    return check()
+  } catch (error) {
+    process.stderr.write(
+      `[claude-codex-adapter] ${error instanceof Error ? error.message : String(error)}\n`,
+    )
+    process.exit(1)
   }
 }
 
@@ -217,7 +321,10 @@ async function spawnDetachedUnixDaemon(): Promise<void> {
       // ensureSingleUnixDaemon exits 0 when a healthy daemon already owns the
       // socket, which is also a successful bootstrap outcome.
       if (code === 0) finish()
-      else finish(new Error(`detached app-server exited before ready (code=${code}, signal=${signal})`))
+      else
+        finish(
+          new Error(`detached app-server exited before ready (code=${code}, signal=${signal})`),
+        )
     }
     const onMessage = (message: unknown) => {
       if (
@@ -248,6 +355,18 @@ function getArg(args: string[], name: string): string | null {
   return inline ? inline.slice(prefix.length) : null
 }
 
+// The values of -c/--config key=value, in order.
+function configArgs(args: string[]): string[] {
+  const values: string[] = []
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index] as string
+    if ((arg === '-c' || arg === '--config') && index + 1 < args.length)
+      values.push(args[++index] as string)
+    else if (arg.startsWith('--config=')) values.push(arg.slice('--config='.length))
+  }
+  return values
+}
+
 function ensureSingleUnixDaemon(listen: string): string {
   const socketPath = listen === 'unix://' ? defaultSocketPath() : listen.slice('unix://'.length)
   const pidFile = `${socketPath}.pid`
@@ -256,7 +375,7 @@ function ensureSingleUnixDaemon(listen: string): string {
     const pid = Number(readFileSync(pidFile, 'utf8'))
     if (Number.isFinite(pid) && processIsAlive(pid)) {
       process.stderr.write(
-        `[chrys-codex-adapter] app-server already running at ${socketPath} (pid ${pid})\n`,
+        `[claude-codex-adapter] app-server already running at ${socketPath} (pid ${pid})\n`,
       )
       process.exit(0)
     }
@@ -282,10 +401,14 @@ function processIsAlive(pid: number): boolean {
 
 function usage(code: number): never {
   const text = `Usage:
-  chrys-codex-adapter app-server --listen stdio://
-  chrys-codex-adapter app-server --listen unix://
-  chrys-codex-adapter app-server --listen ws://127.0.0.1:8788
-  chrys-codex-adapter app-server proxy [--sock PATH]
+  claude-codex-adapter app-server --listen stdio://
+  claude-codex-adapter app-server --listen unix://
+  claude-codex-adapter app-server --listen ws://127.0.0.1:8788
+      [--ws-auth capability-token|none] [--ws-token-file ABS_PATH | --ws-token-sha256 HEX]
+      [--ws-allowed-origins ORIGIN,...] [--ws-allow-unauthenticated]
+  claude-codex-adapter app-server proxy [--sock PATH]
+  claude-codex-adapter app-server --print-startup-config [--startup-client-info JSON]
+  claude-codex-adapter app-server daemon version
 `
   ;(code === 0 ? process.stdout : process.stderr).write(text)
   process.exit(code)
@@ -293,7 +416,7 @@ function usage(code: number): never {
 
 main().catch((error) => {
   process.stderr.write(
-    `[chrys-codex-adapter] ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`,
+    `[claude-codex-adapter] ${error instanceof Error ? (error.stack ?? error.message) : String(error)}\n`,
   )
   process.exit(1)
 })

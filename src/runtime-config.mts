@@ -6,6 +6,7 @@ import {
 export type RuntimeBackendType =
   | 'mock'
   | 'chrys-acp'
+  | 'antigravity-acp'
   | 'agent-sdk-sidecar'
   | 'agent-http'
   | 'agentapi'
@@ -37,7 +38,10 @@ export interface RuntimeConfig {
 
 export function resolveRuntimeConfig(env: NodeJS.ProcessEnv = process.env): RuntimeConfig {
   const explicit = normalizeRuntimeType(
-    env.CLAUDE_CODEX_RUNTIME_TYPE ?? env.CLAUDE_CODEX_RUNTIME ?? env.CLAUDE_CODEX_BACKEND,
+    env.CLAUDE_CODEX_RUNTIME_TYPE ??
+      env.CHRYS_CODEX_RUNTIME_TYPE ??
+      env.CLAUDE_CODEX_RUNTIME ??
+      env.CLAUDE_CODEX_BACKEND,
   )
   const selection = resolveProviderLoopSelection(providerLoopSelectionInputFromEnv(env, explicit))
   const hasProviderSelection = Boolean(env.CLAUDE_CODEX_PROVIDER || env.CLAUDE_CODEX_AGENT_LOOP)
@@ -45,7 +49,10 @@ export function resolveRuntimeConfig(env: NodeJS.ProcessEnv = process.env): Runt
   const type =
     env.CLAUDE_CODEX_MOCK === '1'
       ? 'mock'
-      : explicit == null && !hasProviderSelection && !hasLegacyRuntimeSocket
+      : explicit == null &&
+          env.CHRYS_CODEX_EXECUTABLE &&
+          !hasProviderSelection &&
+          !hasLegacyRuntimeSocket
         ? 'chrys-acp'
         : selection.runtimeType
 
@@ -85,6 +92,10 @@ export function normalizeRuntimeType(value: string | undefined): RuntimeBackendT
   const raw = (value ?? '').trim().toLowerCase()
   if (!raw) return null
   switch (raw) {
+    case 'antigravity':
+    case 'antigravity-acp':
+    case 'agy':
+      return 'antigravity-acp'
     case 'chrys':
     case 'chrys-acp':
     case 'acp':

@@ -3,19 +3,61 @@
 Implemented as real remote/runtime behavior:
 
 - **Transports** — stdio, WebSocket, Unix-socket daemon, and `app-server proxy`
-  raw stdio forwarding.
+  raw stdio forwarding. The WebSocket listener supports Codex's
+  `--ws-auth capability-token` (`--ws-token-file`, `--ws-token-sha256`) and,
+  like `codex app-server`, refuses a non-loopback address without it unless
+  `--ws-allow-unauthenticated` is passed; `signed-bearer-token` is not
+  implemented. The one-shot `app-server --print-startup-config` and
+  `app-server daemon version` probes answer without opening the state database.
 - **Thread lifecycle** — start, resume, fork, list, read, turns list, name,
-  archive/unarchive, unsubscribe, interrupt.
+  archive/unarchive, unsubscribe, interrupt, delete, and rollback/revert that
+  rewind Claude's session to the kept turns.
+- **Several clients per thread** — every connection that opens a thread follows
+  it: notifications reach all of them, approvals and questions go to each and
+  the first answer wins, and one that opens the thread while a request is
+  pending gets it replayed.
+- **History and search** — turn, item and timeline paging; thread search over
+  names, previews and messages; find-in-conversation occurrences.
+- **Projects and attachments** — `project/*` and `thread/attachment/*`, kept in
+  the adapter's SQLite store.
 - **Claude runtime** — query, session resume/fork, partial text streaming,
-  interrupt, MCP config, allowed tools, add dirs, file checkpointing.
-- **Approval bridge** — `Bash` → command approval; `Edit` / `Write` /
-  `MultiEdit` → file-change approval with diffs.
+  interrupt, model and effort switches within a running turn, MCP config,
+  allowed tools, add dirs, file checkpointing.
+- **Turn input** — user input, and the `toolOutput` of a thread handoff as a
+  `functionCallOutput` item.
+- **Approval bridge** — `Bash`, `Read` / `Grep` / `Glob` / `LS` (with Codex
+  command actions) and other tools → command approval; `Edit` / `Write` /
+  `MultiEdit` → file-change approval with diffs; MCP tool calls → the App's MCP
+  tool approval card; declined calls end `declined`, and cancel interrupts the
+  turn; MCP elicitation → the App's form or link prompt. The auto-review
+  reviewer (`approvalsReviewer`, kept per thread) → Claude Code's auto mode,
+  with `item/autoApprovalReview/completed` for a call its classifier denies, or
+  a `configWarning` and `user` echoed back where auto mode is unavailable.
 - **Streaming** — turn started/completed, thread status changes, agent text
-  deltas, reasoning deltas, command output deltas, file patches, generic tool
-  item completion, and aggregated git diff updates.
+  deltas, reasoning deltas, command output deltas, file patches (updated while
+  Claude is still writing the call), file exploration as commands with Codex
+  command actions, image views, web searches and page opens, MCP tool calls by
+  server and tool, hook runs, model reroutes, aggregated git diff updates, and
+  `error` notifications for API retries (`willRetry`; a foreground subagent's,
+  from its Agent call's `tool_progress` `subagent_retry`, in its own thread)
+  and failed turns, with Codex error codes; Claude Code's notices as `warning`
+  notifications and as `error` notifications with `willRetry` and no code,
+  which the App shows as rows under the turn.
+  A subagent's own messages, reasoning and tool calls stream as these items in
+  its own thread's turn.
+- **Request errors** — `-32600` (invalid request) for requests the user can
+  put right, `-32000` for failures inside the adapter and for the project
+  store's errors (the App matches their text), `-32601` for unknown methods.
 - **Remote utilities** — file read/write/list/metadata/copy/remove/watch,
   command exec with stdin/terminate, process spawn/stdin/kill, fuzzy file
   search, direct MCP stdio/HTTP tool and resource calls.
+- **App settings** — `config/value/write` and `config/batchWrite` keep the
+  settings Claude threads honor, MCP servers added in the App's settings
+  included, and refuse the ones they cannot with `INVALID_REQUEST`, all or
+  nothing per batch.
+- **Memories** (opt-in with `CLAUDE_CODEX_MEMORIES=1`) — the `memories`
+  feature and each thread's memory mode decide whether Claude Code runs with
+  its auto-memory.
 - **Per-thread git worktree isolation** (optional).
 
 ## Compatibility-only surfaces
@@ -23,8 +65,9 @@ Implemented as real remote/runtime behavior:
 Some app UI methods return stable empty or inert responses because they are
 OpenAI-account / plugin-marketplace / realtime-specific rather than Claude Code
 runtime capabilities — for example marketplace install/update, OpenAI account
-login/logout, realtime audio, and Windows sandbox setup. They ack so the App's
-capability probe does not error.
+login/logout, realtime audio, remote control, passkey verification and Windows
+sandbox setup. They answer truthfully (empty, disabled or unavailable) instead
+of failing, so the App hides or disables the feature.
 
 See the **[Capability matrix](/reference/capability-matrix)** for the full
 per-area breakdown.

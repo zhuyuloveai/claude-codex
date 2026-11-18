@@ -1,31 +1,42 @@
 import assert from 'node:assert/strict'
 import { once } from 'node:events'
+import { existsSync } from 'node:fs'
 import {
   appendFile,
   chmod,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   realpath,
   rename,
   rm,
+  stat,
   symlink,
+  utimes,
   writeFile,
 } from 'node:fs/promises'
 import http from 'node:http'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { homedir, tmpdir } from 'node:os'
+import { dirname, join } from 'node:path'
 import test from 'node:test'
+import * as z from 'zod'
 import { ClaudePTranscriptRuntime } from '../src/claude-p-runtime.mjs'
 import {
   HttpAgentRuntime,
   hasAgentapiTrustPrompt,
   sanitizeAgentapiTerminalContent,
 } from '../src/http-agent-runtime.mjs'
-import { NativeClaudeRuntime, sdkResumeSessionId } from '../src/native-runtime.mjs'
+import {
+  NativeClaudeRuntime,
+  sdkResumeSessionId,
+  sessionSignature,
+} from '../src/native-runtime.mjs'
+import { TurnInput } from '../src/native-turn-input.mjs'
 import { resolveRuntimeConfig } from '../src/runtime-config.mjs'
 import { buildSystemPromptAddendum } from '../src/server-helpers.mjs'
-import type { RuntimeTurnContext } from '../src/types.mjs'
+import { sessionChangesHint } from '../src/session-changes.mjs'
+import type { DynamicToolServer, RuntimeTurnContext } from '../src/types.mjs'
 import { parseWorkflowCommand, workflowRuntimePrompt } from '../src/workflow-command.mjs'
 import {
   defaultWorkflowTranscriptRoots,
@@ -57,8 +68,8 @@ function nativeTurnContext(overrides: Partial<RuntimeTurnContext> = {}): Runtime
   }
 }
 
-test('runtime config defaults to Chrys ACP and accepts explicit legacy backends', () => {
-  assert.equal(resolveRuntimeConfig({}).type, 'chrys-acp')
+test('runtime config keeps legacy defaults and accepts explicit backends', () => {
+  assert.equal(resolveRuntimeConfig({}).type, 'agent-sdk-sidecar')
   assert.equal(resolveRuntimeConfig({ CLAUDE_CODEX_MOCK: '1' }).type, 'mock')
   assert.equal(
     resolveRuntimeConfig({ CLAUDE_CODEX_RUNTIME_SOCKET: '/tmp/runtime.sock' }).type,
@@ -103,6 +114,106 @@ test('native SDK runtime ignores bridge session markers when resuming SDK turns'
   assert.equal(sdkResumeSessionId('sdk-session'), 'sdk-session')
 })
 
+test('a resumed transcript is copied only into the config dir its session runs from', async () => {
+  const root = await realpath(await mkdtemp(join(tmpdir(), 'claude-codex-transcripts-')))
+  const cwd = join(root, 'work')
+  const slug = cwd.replace(/[^a-zA-Z0-9-]/g, '-')
+  const transcript = (configDir: string) => join(configDir, 'projects', slug, 'session.jsonl')
+  const ownRoot = join(root, '.claude')
+  const routers = join(root, '.cache', 'router-tool', 'claude-router')
+  const routerRoot = join(routers, 'router-model')
+  const otherRouterRoot = join(routers, 'other-model')
+  const extraRoot = join(root, 'extra', 'extra-model')
+  const keys = [
+    'HOME',
+    'CLAUDE_CONFIG_DIR',
+    'CLAUDE_CONFIG_DIRS',
+    'CLAUDE_ROUTER_DIR',
+    'CLAUDE_CODEX_CLI',
+  ]
+  const saved = keys.map((key) => [key, process.env[key]] as const)
+  for (const key of keys) delete process.env[key]
+  process.env.HOME = root
+  process.env.CLAUDE_CONFIG_DIRS = join(root, 'extra')
+  try {
+    await mkdir(cwd, { recursive: true })
+    await mkdir(otherRouterRoot, { recursive: true })
+    await mkdir(extraRoot, { recursive: true })
+    await mkdir(dirname(transcript(routerRoot)), { recursive: true })
+    await writeFile(transcript(routerRoot), '{"n":1}\n', { mode: 0o600 })
+    const sourceTime = new Date(Date.now() - 60_000)
+    await utimes(transcript(routerRoot), sourceTime, sourceTime)
+
+    // The SDK's own Claude Code runs from ~/.claude: the transcript goes there
+    // and nowhere else, with its owner-only mode and its mtime.
+    assert.equal(sdkResumeSessionId('session', cwd, undefined, 'router-model'), 'session')
+    const copied = await stat(transcript(ownRoot))
+    assert.equal(await readFile(transcript(ownRoot), 'utf8'), '{"n":1}\n')
+    assert.equal(copied.mode & 0o777, 0o600)
+    assert.equal((await stat(dirname(transcript(ownRoot)))).mode & 0o777, 0o700)
+    assert.equal(Math.round(copied.mtimeMs), Math.round(sourceTime.getTime()))
+    assert.equal(existsSync(transcript(otherRouterRoot)), false)
+    assert.equal(existsSync(transcript(extraRoot)), false)
+    assert.equal(existsSync(transcript(join(root, 'extra'))), false)
+    assert.deepEqual(
+      (await readdir(dirname(transcript(ownRoot)))).filter((name) => name.endsWith('.tmp')),
+      [],
+    )
+
+    // An up-to-date copy is not copied again.
+    assert.equal(sdkResumeSessionId('session', cwd, undefined, 'router-model'), 'session')
+    assert.equal((await stat(transcript(ownRoot))).ino, copied.ino)
+
+    // A newer source replaces a stale copy.
+    await appendFile(transcript(routerRoot), '{"n":2}\n')
+    assert.equal(sdkResumeSessionId('session', cwd, undefined, 'router-model'), 'session')
+    assert.equal(await readFile(transcript(ownRoot), 'utf8'), '{"n":1}\n{"n":2}\n')
+    const refreshed = await stat(transcript(ownRoot))
+    assert.notEqual(refreshed.ino, copied.ino)
+    assert.equal(refreshed.mode & 0o777, 0o600)
+
+    // Once the session went on where it runs, that copy is the newest: it is
+    // resumed as it is, and nothing is copied back.
+    await appendFile(transcript(ownRoot), '{"n":3}\n')
+    const later = new Date(Date.now() + 60_000)
+    await utimes(transcript(ownRoot), later, later)
+    assert.equal(sdkResumeSessionId('session', cwd, undefined, 'router-model'), 'session')
+    assert.equal((await stat(transcript(ownRoot))).ino, refreshed.ino)
+    assert.equal(await readFile(transcript(routerRoot), 'utf8'), '{"n":1}\n{"n":2}\n')
+
+    // Nor does a shorter copy replace it, however new its mtime (another file
+    // system's clock, a stale copy touched since): that would drop turns.
+    const skewed = new Date(Date.now() + 120_000)
+    await utimes(transcript(routerRoot), skewed, skewed)
+    assert.equal(sdkResumeSessionId('session', cwd, undefined, 'router-model'), 'session')
+    assert.equal((await stat(transcript(ownRoot))).ino, refreshed.ino)
+    assert.equal(await readFile(transcript(ownRoot), 'utf8'), '{"n":1}\n{"n":2}\n{"n":3}\n')
+    await utimes(transcript(routerRoot), sourceTime, sourceTime)
+
+    // A custom Claude Code, such as a model router, runs a model from the
+    // router config dir named after it.
+    process.env.CLAUDE_CODEX_CLI = join(root, 'router-claude')
+    assert.equal(sdkResumeSessionId('session', cwd, undefined, 'other-model'), 'session')
+    assert.equal(await readFile(transcript(otherRouterRoot), 'utf8'), '{"n":1}\n{"n":2}\n{"n":3}\n')
+    assert.equal(existsSync(transcript(extraRoot)), false)
+    assert.equal(sdkResumeSessionId('session', cwd, undefined, 'extra-model'), 'session')
+    assert.equal(existsSync(transcript(extraRoot)), true)
+    // A model it has no config dir for, or no plain name, runs from ~/.claude.
+    const own = (await stat(transcript(ownRoot))).ino
+    assert.equal(sdkResumeSessionId('session', cwd, undefined, '../other-model'), 'session')
+    assert.equal((await stat(transcript(ownRoot))).ino, own)
+
+    // A session no config dir has is not resumed.
+    assert.equal(sdkResumeSessionId('missing', cwd, undefined, 'router-model'), null)
+  } finally {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key]
+      else process.env[key] = value
+    }
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('native SDK runtime maps manual /workflows prompts to the human workflow trigger', async () => {
   const runtime = new NativeClaudeRuntime()
   const context = nativeTurnContext({
@@ -110,9 +221,8 @@ test('native SDK runtime maps manual /workflows prompts to the human workflow tr
     approvalPolicy: 'never',
     sandboxMode: 'danger-full-access',
   })
-  const buildPromptIterable = Reflect.get(runtime, 'buildPromptIterable')
-  const messages: any[] = []
-  for await (const message of buildPromptIterable.call(runtime, context)) messages.push(message)
+  const buildPromptMessage = Reflect.get(runtime, 'buildPromptMessage')
+  const messages: any[] = [buildPromptMessage.call(runtime, context)]
 
   assert.equal(
     messages[0].message.content,
@@ -125,30 +235,531 @@ test('native SDK runtime maps manual /workflows prompts to the human workflow tr
   assert.deepEqual(messages[0].origin, { kind: 'human' })
 
   const buildOptions = Reflect.get(runtime, 'buildOptions')
-  const options = buildOptions.call(runtime, {}, context, new AbortController())
-  assert.deepEqual(options.settings, {
-    enableWorkflows: true,
-    workflowKeywordTriggerEnabled: true,
-  })
+  const session = { current: { context, handlers: {}, resolved: false }, lastContext: context }
+  const options = buildOptions.call(runtime, {}, context, new AbortController(), () => session)
+  // Pinned launchers reject --settings, so workflows are enabled by env alone.
+  assert.equal(options.settings, undefined)
+  assert.equal(options.env.CLAUDE_CODE_WORKFLOWS, '1')
+  assert.equal(options.env.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS, '1')
   assert.equal(options.permissionMode, 'default')
   assert.equal(options.allowDangerouslySkipPermissions, undefined)
   assert.equal(typeof options.canUseTool, 'function')
-  const turns = Reflect.get(runtime, 'turns') as Map<string, unknown>
-  turns.set(context.turnId, { handlers: {} })
+  assert.deepEqual(
+    await options.canUseTool(
+      'Bash',
+      { command: 'true' },
+      {
+        toolUseID: 'tool',
+        signal: new AbortController().signal,
+      },
+    ),
+    { behavior: 'allow' },
+  )
+})
+
+test('native SDK runtime switches auto-memory off only for threads the memories mapping keeps from it', () => {
+  const runtime = new NativeClaudeRuntime()
+  const buildOptions = Reflect.get(runtime, 'buildOptions')
+  const envFor = (overrides: Partial<RuntimeTurnContext>) => {
+    const context = nativeTurnContext(overrides)
+    const session = { current: { context, handlers: {}, resolved: false }, lastContext: context }
+    return buildOptions.call(runtime, {}, context, new AbortController(), () => session)
+      .env as NodeJS.ProcessEnv
+  }
+  const previous = process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY
   try {
-    assert.deepEqual(
-      await options.canUseTool(
-        'Bash',
-        { command: 'true' },
-        {
-          toolUseID: 'tool',
-          signal: new AbortController().signal,
-        },
-      ),
-      { behavior: 'allow' },
-    )
+    delete process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY
+    // Without the memories mapping (no autoMemory) the launch adds nothing,
+    // and Claude Code's own settings decide.
+    assert.equal(envFor({}).CLAUDE_CODE_DISABLE_AUTO_MEMORY, undefined)
+    assert.equal(envFor({}).CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS, '1')
+    // With it, a thread kept from auto-memory gets the CLI's own switch, not
+    // --settings.
+    assert.equal(envFor({ autoMemory: false }).CLAUDE_CODE_DISABLE_AUTO_MEMORY, '1')
+    assert.equal(envFor({ autoMemory: true }).CLAUDE_CODE_DISABLE_AUTO_MEMORY, undefined)
+
+    // A value the user exported passes through without the mapping. With it,
+    // one that forces auto-memory on does not override a thread without
+    // memories, and one that turns it off still wins.
+    process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = '0'
+    assert.equal(envFor({}).CLAUDE_CODE_DISABLE_AUTO_MEMORY, '0')
+    assert.equal(envFor({ autoMemory: false }).CLAUDE_CODE_DISABLE_AUTO_MEMORY, '1')
+    assert.equal(envFor({ autoMemory: true }).CLAUDE_CODE_DISABLE_AUTO_MEMORY, '0')
+    process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = '1'
+    assert.equal(envFor({}).CLAUDE_CODE_DISABLE_AUTO_MEMORY, '1')
+    assert.equal(envFor({ autoMemory: true }).CLAUDE_CODE_DISABLE_AUTO_MEMORY, '1')
   } finally {
-    turns.delete(context.turnId)
+    if (previous === undefined) delete process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY
+    else process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = previous
+  }
+})
+
+test('native SDK runtime sets the auto-compact window only when the thread has one', () => {
+  const runtime = new NativeClaudeRuntime()
+  const buildOptions = Reflect.get(runtime, 'buildOptions')
+  const envFor = (overrides: Partial<RuntimeTurnContext>) => {
+    const context = nativeTurnContext(overrides)
+    const session = { current: { context, handlers: {}, resolved: false }, lastContext: context }
+    return buildOptions.call(runtime, {}, context, new AbortController(), () => session)
+      .env as NodeJS.ProcessEnv
+  }
+  const previous = process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW
+  try {
+    delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW
+    // Without Codex's limit the launch adds nothing: Claude Code's own window.
+    assert.equal(envFor({}).CLAUDE_CODE_AUTO_COMPACT_WINDOW, undefined)
+    assert.equal(envFor({ autoCompactWindow: null }).CLAUDE_CODE_AUTO_COMPACT_WINDOW, undefined)
+    assert.equal(envFor({ autoCompactWindow: 250_000 }).CLAUDE_CODE_AUTO_COMPACT_WINDOW, '250000')
+    // A window the user exported stays unless the thread has its own.
+    process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = '400000'
+    assert.equal(envFor({}).CLAUDE_CODE_AUTO_COMPACT_WINDOW, '400000')
+    assert.equal(envFor({ autoCompactWindow: 250_000 }).CLAUDE_CODE_AUTO_COMPACT_WINDOW, '250000')
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW
+    else process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = previous
+  }
+})
+
+test('a new auto-compact window starts a new native session', () => {
+  // The window is fixed when the CLI starts, so a session started with
+  // another one cannot carry the turn.
+  const base = sessionSignature(nativeTurnContext())
+  assert.equal(sessionSignature(nativeTurnContext({ autoCompactWindow: null })), base)
+  const window = sessionSignature(nativeTurnContext({ autoCompactWindow: 300_000 }))
+  assert.notEqual(window, base)
+  assert.equal(sessionSignature(nativeTurnContext({ autoCompactWindow: 300_000 })), window)
+  assert.notEqual(sessionSignature(nativeTurnContext({ autoCompactWindow: 500_000 })), window)
+})
+
+test('native SDK runtime asks Claude Code to report every startup failure as a result, unless the environment says otherwise', () => {
+  const runtime = new NativeClaudeRuntime()
+  const buildOptions = Reflect.get(runtime, 'buildOptions')
+  const context = nativeTurnContext({})
+  const session = { current: { context, handlers: {}, resolved: false }, lastContext: context }
+  const env = () =>
+    buildOptions.call(runtime, {}, context, new AbortController(), () => session)
+      .env as NodeJS.ProcessEnv
+  const previous = process.env.CLAUDE_CODE_STARTUP_FAILURE_RESULTS
+  try {
+    delete process.env.CLAUDE_CODE_STARTUP_FAILURE_RESULTS
+    assert.equal(env().CLAUDE_CODE_STARTUP_FAILURE_RESULTS, '1')
+    process.env.CLAUDE_CODE_STARTUP_FAILURE_RESULTS = '0'
+    assert.equal(env().CLAUDE_CODE_STARTUP_FAILURE_RESULTS, '0')
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_CODE_STARTUP_FAILURE_RESULTS
+    else process.env.CLAUDE_CODE_STARTUP_FAILURE_RESULTS = previous
+  }
+})
+
+test("native SDK runtime leaves fork subagents to Claude Code and the adapter's environment", () => {
+  const runtime = new NativeClaudeRuntime()
+  const buildOptions = Reflect.get(runtime, 'buildOptions')
+  const context = nativeTurnContext({ planMode: true })
+  const session = { current: { context, handlers: {}, resolved: false }, lastContext: context }
+  const env = () =>
+    buildOptions.call(runtime, {}, context, new AbortController(), () => session)
+      .env as NodeJS.ProcessEnv
+  const previous = process.env.CLAUDE_CODE_FORK_SUBAGENT
+  try {
+    // Unset, the adapter adds nothing and Claude Code's default applies.
+    delete process.env.CLAUDE_CODE_FORK_SUBAGENT
+    assert.equal(env().CLAUDE_CODE_FORK_SUBAGENT, undefined)
+    // A value the user exported reaches the CLI as it is.
+    for (const value of ['0', '1']) {
+      process.env.CLAUDE_CODE_FORK_SUBAGENT = value
+      assert.equal(env().CLAUDE_CODE_FORK_SUBAGENT, value)
+    }
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_CODE_FORK_SUBAGENT
+    else process.env.CLAUDE_CODE_FORK_SUBAGENT = previous
+  }
+})
+
+test('native SDK runtime approves goal tools without shadowing canUseTool', async () => {
+  const runtime = new NativeClaudeRuntime()
+  Reflect.set(runtime, 'zod', z)
+  const sdk = {
+    tool: (...args: unknown[]) => args,
+    createSdkMcpServer: (config: Record<string, unknown>) => ({ type: 'sdk', ...config }),
+  }
+  const goalTools = {
+    getGoal: async () => '{}',
+    createGoal: async () => '{}',
+    updateGoal: async () => '{}',
+  }
+  const buildOptions = Reflect.get(runtime, 'buildOptions')
+  const build = (overrides: Partial<RuntimeTurnContext>) =>
+    buildOptions.call(
+      runtime,
+      sdk,
+      nativeTurnContext({ prompt: 'work on the goal', goalTools, ...overrides }),
+      new AbortController(),
+      () => null,
+    )
+
+  const options = build({ approvalPolicy: 'on-request', sandboxMode: 'workspace-write' })
+  assert.ok(options.mcpServers.codex_goal)
+  assert.equal(options.allowedTools?.includes('mcp__codex_goal') ?? false, false)
+  const signal = new AbortController().signal
+  // Even with no turn to ask in, goal bookkeeping is allowed while other
+  // tools still need the user.
+  assert.deepEqual(
+    await options.canUseTool('mcp__codex_goal__update_goal', { status: 'complete' }, { signal }),
+    { behavior: 'allow' },
+  )
+  assert.equal((await options.canUseTool('Bash', { command: 'true' }, { signal })).behavior, 'deny')
+  // Only the goal server's own tools: a server whose name starts with it asks.
+  assert.equal(
+    (await options.canUseTool('mcp__codex_goal__x__update_goal', {}, { signal })).behavior,
+    'deny',
+  )
+
+  // Plan mode keeps the callback too, and it allows goal bookkeeping there.
+  const plan = build({ planMode: true, approvalPolicy: 'never' })
+  assert.equal(plan.permissionMode, 'plan')
+  assert.equal(typeof plan.canUseTool, 'function')
+  assert.equal(plan.allowedTools?.includes('mcp__codex_goal') ?? false, false)
+  assert.deepEqual(
+    await plan.canUseTool('mcp__codex_goal__update_goal', { status: 'complete' }, { signal }),
+    { behavior: 'allow' },
+  )
+  // Between turns, plan mode's read-only promise outranks Full Access.
+  assert.equal((await plan.canUseTool('Bash', { command: 'true' }, { signal })).behavior, 'deny')
+})
+
+test('native SDK runtime offers dynamic tools as MCP servers and routes calls to the turn', async () => {
+  const runtime = new NativeClaudeRuntime()
+  Reflect.set(runtime, 'zod', z)
+  const sdk = {
+    tool: (
+      name: string,
+      description: string,
+      schema: { meta: () => unknown },
+      handler: (args: unknown, extra: unknown) => Promise<unknown>,
+      extras: unknown,
+    ) => ({ name, description, schema, handler, extras }),
+    createSdkMcpServer: (config: Record<string, unknown>) => ({ type: 'sdk', ...config }),
+  }
+  const listSchema = {
+    type: 'object',
+    properties: { query: { type: 'string' } },
+    required: ['query'],
+  }
+  const dynamicTools: DynamicToolServer[] = [
+    {
+      server: 'codex_app',
+      namespace: 'codex_app',
+      description: 'Tools provided by the app.',
+      tools: [
+        {
+          name: 'list_artifacts',
+          description: 'List artifacts.',
+          inputSchema: listSchema,
+          deferLoading: false,
+        },
+        {
+          name: 'restore_worktree',
+          description: 'Restore a worktree.',
+          inputSchema: { type: 'object' },
+          deferLoading: true,
+        },
+      ],
+    },
+    {
+      server: 'dynamic_tools',
+      namespace: null,
+      description: '',
+      tools: [
+        {
+          name: 'echo',
+          description: 'Echo.',
+          inputSchema: { type: 'object' },
+          deferLoading: false,
+        },
+      ],
+    },
+    // A server the adapter already runs keeps its name.
+    {
+      server: 'codex_goal',
+      namespace: 'codex_goal',
+      description: '',
+      tools: [
+        { name: 'shadow', description: '', inputSchema: { type: 'object' }, deferLoading: false },
+      ],
+    },
+  ]
+  const context = nativeTurnContext({
+    approvalPolicy: 'on-request',
+    sandboxMode: 'workspace-write',
+    dynamicTools,
+  })
+  const calls: unknown[] = []
+  const pending = {
+    context,
+    resolved: false,
+    handlers: {
+      onDynamicToolCall: async (request: unknown, signal: AbortSignal) => {
+        calls.push({ request, aborted: signal.aborted })
+        return {
+          contentItems: [
+            { type: 'inputText', text: '2 artifacts' },
+            { type: 'inputImage', imageUrl: 'data:image/png;base64,AAAA' },
+            { type: 'inputImage', imageUrl: 'data:image/svg+xml;base64,AAAA' },
+          ],
+          success: true,
+        }
+      },
+    },
+  }
+  const session: { current: typeof pending | null; lastContext: RuntimeTurnContext } = {
+    current: pending,
+    lastContext: context,
+  }
+  const buildOptions = Reflect.get(runtime, 'buildOptions')
+  const options = buildOptions.call(runtime, sdk, context, new AbortController(), () => session)
+  assert.deepEqual(Object.keys(options.mcpServers), ['codex_app', 'dynamic_tools'])
+  const app = options.mcpServers.codex_app
+  assert.equal(app.name, 'codex_app')
+  assert.equal(app.instructions, 'Tools provided by the app.')
+  assert.equal('instructions' in options.mcpServers.dynamic_tools, false)
+  assert.deepEqual(
+    app.tools.map((tool: any) => [tool.name, tool.description, tool.extras]),
+    [
+      ['list_artifacts', 'List artifacts.', { alwaysLoad: true }],
+      // Deferred tools wait for Claude Code's tool search.
+      ['restore_worktree', 'Restore a worktree.', undefined],
+    ],
+  )
+  // The client's schema is what the server lists.
+  assert.deepEqual(app.tools[0].schema.meta(), listSchema)
+
+  // The tools run without an approval prompt, even where other tools ask.
+  const signal = new AbortController().signal
+  assert.deepEqual(await options.canUseTool('mcp__codex_app__list_artifacts', {}, { signal }), {
+    behavior: 'allow',
+  })
+  assert.deepEqual(await options.canUseTool('mcp__dynamic_tools__echo', {}, { signal }), {
+    behavior: 'allow',
+  })
+
+  // Claude Code's tool use id becomes the call id.
+  const result = await app.tools[0].handler(
+    { query: 'reports' },
+    { signal, _meta: { 'claudecode/toolUseId': 'toolu_1' } },
+  )
+  assert.deepEqual(result, {
+    content: [
+      { type: 'text', text: '2 artifacts' },
+      { type: 'image', data: 'AAAA', mimeType: 'image/png' },
+      { type: 'text', text: '[image omitted]' },
+    ],
+  })
+  await options.mcpServers.dynamic_tools.tools[0].handler({}, { signal })
+  assert.deepEqual(calls[0], {
+    request: {
+      callId: 'toolu_1',
+      namespace: 'codex_app',
+      tool: 'list_artifacts',
+      arguments: { query: 'reports' },
+    },
+    aborted: false,
+  })
+  const loose = (calls[1] as { request: Record<string, unknown> }).request
+  assert.match(String(loose.callId), /^call-/)
+  assert.equal(loose.namespace, null)
+  assert.equal(loose.tool, 'echo')
+
+  // A failed call is an error result; between turns nothing can answer.
+  pending.handlers.onDynamicToolCall = async () => ({
+    contentItems: [{ type: 'inputText', text: 'dynamic tool request failed' }],
+    success: false,
+  })
+  assert.deepEqual(await app.tools[0].handler({ query: 'x' }, { signal }), {
+    content: [{ type: 'text', text: 'dynamic tool request failed' }],
+    isError: true,
+  })
+  session.current = null
+  assert.deepEqual(await app.tools[0].handler({ query: 'x' }, { signal }), {
+    content: [
+      {
+        type: 'text',
+        text: 'list_artifacts was not run because no user turn was active to answer it; the user can re-run it in a turn.',
+      },
+    ],
+    isError: true,
+  })
+  assert.equal(calls.length, 2)
+
+  // Plan mode offers none of them.
+  const plan = buildOptions.call(
+    runtime,
+    sdk,
+    { ...context, planMode: true },
+    new AbortController(),
+    () => session,
+  )
+  assert.equal(plan.mcpServers, undefined)
+})
+
+test('native SDK runtime serves the leader tools, and only the looking ones in plan mode', async () => {
+  const runtime = new NativeClaudeRuntime()
+  Reflect.set(runtime, 'zod', z)
+  const sdk = {
+    tool: (...args: unknown[]) => args,
+    createSdkMcpServer: (config: Record<string, unknown>) => ({ type: 'sdk', ...config }),
+  }
+  const calls: Array<{ tool: string; input: unknown; signal: unknown }> = []
+  const record =
+    (tool: string) =>
+    async (input: unknown, signal?: AbortSignal): Promise<string> => {
+      calls.push({ tool, input, signal })
+      return `${tool} ok`
+    }
+  const leaderTools = {
+    list: record('list'),
+    start: record('start'),
+    prompt: record('prompt'),
+    wait: record('wait'),
+    read: record('read'),
+  }
+  const buildOptions = Reflect.get(runtime, 'buildOptions')
+  const build = (overrides: Partial<RuntimeTurnContext>) =>
+    buildOptions.call(runtime, sdk, nativeTurnContext(overrides), new AbortController(), () => null)
+
+  assert.equal(build({}).mcpServers, undefined)
+  const options = build({
+    leaderTools,
+    approvalPolicy: 'on-request',
+    sandboxMode: 'workspace-write',
+  })
+  const server = options.mcpServers.codex_leader
+  const tools = new Map<string, any[]>(server.tools.map((tool: any[]) => [tool[0], tool]))
+  assert.deepEqual(
+    [...tools.keys()],
+    ['thread_list', 'thread_start', 'thread_prompt', 'thread_wait', 'thread_read'],
+  )
+  assert.match(tools.get('thread_start')?.[1], /Agent tool/)
+  assert.match(tools.get('thread_start')?.[1], /::created-thread line[^\n]*final response/)
+  assert.deepEqual(
+    [...tools.values()].filter((tool) => tool[4]?.annotations?.readOnlyHint).map((tool) => tool[0]),
+    ['thread_list', 'thread_wait', 'thread_read'],
+  )
+  // The SDK's abort signal reaches the waiting handlers; a thrown error
+  // becomes an error result.
+  const signal = new AbortController().signal
+  const result = await tools.get('thread_wait')?.[3]({ threadIds: ['a'] }, { signal })
+  assert.deepEqual(result, { content: [{ type: 'text', text: 'wait ok' }] })
+  assert.deepEqual(calls.at(-1), { tool: 'wait', input: { threadIds: ['a'] }, signal })
+  leaderTools.read = async () => {
+    throw new Error('unknown thread: gone')
+  }
+  const failed = await build({ leaderTools }).mcpServers.codex_leader.tools[4][3]({
+    threadId: 'gone',
+  })
+  assert.deepEqual(failed, {
+    content: [{ type: 'text', text: 'unknown thread: gone' }],
+    isError: true,
+  })
+  // Allowed without asking, like the goal tools, while other tools still ask.
+  assert.deepEqual(
+    await options.canUseTool('mcp__codex_leader__thread_start', { prompt: 'x' }, { signal }),
+    { behavior: 'allow' },
+  )
+  assert.equal((await options.canUseTool('Bash', { command: 'true' }, { signal })).behavior, 'deny')
+
+  // A plan only looks: plan mode lets the looking tools through and turns
+  // away starting or prompting another chat.
+  const planContext = nativeTurnContext({ leaderTools, planMode: true })
+  const planSession = {
+    current: { context: planContext, resolved: false, handlers: { onEvent: async () => {} } },
+    lastContext: planContext,
+  }
+  const plan = buildOptions.call(
+    runtime,
+    sdk,
+    planContext,
+    new AbortController(),
+    () => planSession,
+  )
+  assert.ok(plan.mcpServers.codex_leader)
+  const decisions: Record<string, string> = {}
+  for (const tool of tools.keys())
+    decisions[tool] = (
+      await plan.canUseTool(`mcp__codex_leader__${tool}`, {}, { toolUseID: tool, signal })
+    ).behavior
+  assert.deepEqual(decisions, {
+    thread_list: 'allow',
+    thread_start: 'deny',
+    thread_prompt: 'deny',
+    thread_wait: 'allow',
+    thread_read: 'allow',
+  })
+})
+
+test('native SDK runtime serves the chat changes, and outside git tells Claude of them', async () => {
+  const runtime = new NativeClaudeRuntime()
+  Reflect.set(runtime, 'zod', z)
+  const sdk = {
+    tool: (...args: unknown[]) => args,
+    createSdkMcpServer: (config: Record<string, unknown>) => ({ type: 'sdk', ...config }),
+  }
+  const calls: Array<{ input: unknown; session: { cwd: string; configRoots: string[] } }> = []
+  const sessionChanges = {
+    changes: async (input: unknown, session: { cwd: string; configRoots: string[] }) => {
+      calls.push({ input, session })
+      return 'the diff'
+    },
+  }
+  const buildOptions = Reflect.get(runtime, 'buildOptions')
+  const build = (overrides: Partial<RuntimeTurnContext>) =>
+    buildOptions.call(runtime, sdk, nativeTurnContext(overrides), new AbortController(), () => null)
+  const cwd = await realpath(await mkdtemp(join(tmpdir(), 'claude-codex-session-tool-')))
+  try {
+    assert.equal(build({ cwd }).mcpServers, undefined)
+    const options = build({
+      cwd,
+      sessionChanges,
+      systemPromptAddendum: 'Be brief.',
+      approvalPolicy: 'on-request',
+      sandboxMode: 'workspace-write',
+    })
+    const server = options.mcpServers.codex_session
+    assert.equal(server.alwaysLoad, true)
+    const [tool] = server.tools
+    assert.equal(tool[0], 'changes')
+    assert.deepEqual(tool[4], { annotations: { readOnlyHint: true } })
+    assert.deepEqual(await tool[3]({ stat: true }), {
+      content: [{ type: 'text', text: 'the diff' }],
+    })
+    // The handler reads the transcripts of the turn's cwd, in the config dirs
+    // sessions may have run from.
+    assert.deepEqual(calls[0]?.input, { stat: true })
+    assert.equal(calls[0]?.session.cwd, cwd)
+    assert.ok(calls[0]?.session.configRoots.includes(join(homedir(), '.claude')))
+    sessionChanges.changes = async () => {
+      throw new Error('Cannot tell when those turns started.')
+    }
+    assert.deepEqual(await tool[3]({ turns: 1 }), {
+      content: [{ type: 'text', text: 'Cannot tell when those turns started.' }],
+      isError: true,
+    })
+
+    // Outside git the system prompt says where the changes are, after the
+    // App's own instructions; inside, git has them.
+    const hint = sessionChangesHint(cwd)
+    if (hint !== null) assert.match(hint, /mcp__codex_session__changes/)
+    assert.equal(options.systemPrompt.append, ['Be brief.', hint].filter(Boolean).join('\n\n'))
+    await mkdir(join(cwd, '.git'))
+    assert.equal(build({ cwd, sessionChanges }).systemPrompt.append, undefined)
+
+    // Allowed without asking, in plan mode too: it only reads.
+    const signal = new AbortController().signal
+    for (const built of [options, build({ cwd, sessionChanges, planMode: true })])
+      assert.deepEqual(await built.canUseTool('mcp__codex_session__changes', {}, { signal }), {
+        behavior: 'allow',
+      })
+  } finally {
+    await rm(cwd, { recursive: true, force: true })
   }
 })
 
@@ -180,6 +791,11 @@ test('workflow command parser keeps list and run semantics distinct', () => {
     prompt: 'inspect the adapter',
   })
   assert.equal(parseWorkflowCommand('/workflowsx inspect'), null)
+  assert.deepEqual(parseWorkflowCommand('/workflows list'), { type: 'list' })
+  assert.deepEqual(parseWorkflowCommand('/workflows list the open bugs'), {
+    type: 'run',
+    prompt: 'list the open bugs',
+  })
   assert.equal(workflowRuntimePrompt('/workflows'), '/workflows')
 
   const runtime = new NativeClaudeRuntime()
@@ -191,6 +807,7 @@ test('workflow command parser keeps list and run semantics distinct', () => {
     new AbortController(),
   )
   assert.equal(options.settings, undefined)
+  assert.equal(options.env?.CLAUDE_CODE_WORKFLOWS, undefined)
 })
 
 test('workflow transcript roots follow CLAUDE_CONFIG_DIR and HOME deterministically', () => {
@@ -208,7 +825,7 @@ test('workflow transcript roots follow CLAUDE_CONFIG_DIR and HOME deterministica
 
 test('manual workflow normalization preserves attached image blocks', async () => {
   const runtime = new NativeClaudeRuntime()
-  const buildPromptIterable = Reflect.get(runtime, 'buildPromptIterable')
+  const buildPromptMessage = Reflect.get(runtime, 'buildPromptMessage')
   const context = nativeTurnContext({
     prompt: '/workflows inspect this image',
     imageInputs: [
@@ -220,8 +837,7 @@ test('manual workflow normalization preserves attached image blocks', async () =
       },
     ],
   })
-  const messages: any[] = []
-  for await (const message of buildPromptIterable.call(runtime, context)) messages.push(message)
+  const messages: any[] = [buildPromptMessage.call(runtime, context)]
   assert.match(messages[0].message.content[0].text, /^ultracode: inspect this image/)
   assert.deepEqual(messages[0].message.content[1], {
     type: 'image',
@@ -250,6 +866,7 @@ test('native SDK runtime projects workflow journal agents into separate live Age
   const events: any[] = []
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowToolUseIds: new Set<string>(),
     workflowTranscriptRoots: [root],
@@ -421,6 +1038,7 @@ test('native SDK runtime waits for a slightly delayed workflow journal result', 
   const events: any[] = []
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowToolUseIds: new Set(['delayed-workflow-launch']),
     workflowTranscriptRoots: [root],
@@ -521,7 +1139,9 @@ test('native SDK parent result does not cap workflow runtime at three seconds', 
   let resolved = false
   const pending = {
     context: nativeTurnContext({ turnId: 'parent-result-workflow-turn' }),
+    input: new TurnInput(),
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowToolUseIds: new Set(['parent-result-workflow-launch']),
     workflowTranscriptRoots: [root],
@@ -650,6 +1270,7 @@ test('native SDK runtime waits for the workflow agent prompt file before project
   const events: any[] = []
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowToolUseIds: new Set(['delayed-prompt-launch']),
     workflowTranscriptRoots: [root],
@@ -729,6 +1350,7 @@ test('native SDK runtime attaches a deferred Workflow launch after task_started 
   const events: any[] = []
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowToolUseIds: new Set(['deferred-workflow-launch']),
     workflowTranscriptRoots: [root],
@@ -794,6 +1416,7 @@ test('native SDK runtime falls back to aggregate Agent when workflow journal sta
   const events: any[] = []
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowToolUseIds: new Set(['empty-workflow-launch']),
     workflowTranscriptRoots: [root],
@@ -857,6 +1480,7 @@ test('native SDK runtime settles an out-of-order workflow task notification', as
   const events: any[] = []
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowToolUseIds: new Set<string>(),
     workflowTranscriptRoots: [process.cwd()],
@@ -891,6 +1515,7 @@ test('native SDK runtime accepts the declared SDK task_notification shape', asyn
   const events: any[] = []
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     // The real SDK notification may omit task_type/workflow_name. The
     // tool_use_id is the stable correlation key when the Workflow launch is
@@ -944,6 +1569,7 @@ test('native SDK runtime accepts Workflow launch metadata after the old fallback
   const events: any[] = []
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowToolUseIds: new Set(['late-workflow-launch']),
     workflowTranscriptRoots: [root],
@@ -1019,6 +1645,7 @@ test('native SDK runtime hides skip_transcript workflow journals', async () => {
   const events: any[] = []
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowToolUseIds: new Set(['hidden-workflow-launch']),
     workflowTranscriptRoots: [root],
@@ -1102,6 +1729,7 @@ test('native SDK runtime ignores workflow-shaped metadata from a non-Workflow to
   const events: any[] = []
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowToolUseIds: new Set<string>(),
     workflowTranscriptRoots: [root],
@@ -1170,6 +1798,7 @@ test('native SDK runtime rejects Workflow launch metadata bound to a different t
   const events: any[] = []
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowToolUseIds: new Set(['mismatched-workflow-launch']),
     workflowTranscriptRoots: [root],
@@ -1238,6 +1867,7 @@ test('native SDK runtime rejects ambiguous batched Workflow tool results', async
   const events: any[] = []
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowToolUseIds: new Set(['workflow-launch']),
     workflowTranscriptRoots: [root],
@@ -1313,6 +1943,7 @@ test('native SDK runtime rejects a symlinked workflow journal file', async () =>
   const events: any[] = []
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowToolUseIds: new Set(['journal-symlink-launch']),
     workflowTranscriptRoots: [root],
@@ -1402,6 +2033,7 @@ test('native SDK runtime rejects workflow transcript symlinks that escape the tr
   const events: any[] = []
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowToolUseIds: new Set(['trusted-workflow-launch']),
     workflowTranscriptRoots: [trustedRoot],
@@ -1491,6 +2123,7 @@ test('native SDK runtime rejects a workflow directory replaced after canonical v
   const events: any[] = []
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowToolUseIds: new Set(['directory-swap-launch']),
     workflowTranscriptRoots: [root],
@@ -1550,6 +2183,7 @@ test('native SDK runtime falls back to one Agent lifecycle without workflow jour
   const events: any[] = []
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     handlers: { onEvent: async (event: unknown) => events.push(event) },
   }
@@ -1588,6 +2222,7 @@ test('native SDK runtime ignores non-workflow task notifications', async () => {
   const events: any[] = []
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowTasks: new Map(),
     handlers: { onEvent: async (event: unknown) => events.push(event) },
@@ -1612,6 +2247,7 @@ test('native SDK runtime closes lagged workflow agents using the terminal task s
   const agentToolUseId = `workflow-agent:${taskId}:${agentId}`
   const pending = {
     activeSubagents: new Set<string>([agentToolUseId]),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowTasks: new Map([
       [
@@ -1662,6 +2298,7 @@ test('native SDK runtime bounds terminal workflow monitor flushes', async () => 
   const taskId = 'blocked-flush-workflow-task'
   const pending = {
     activeSubagents: new Set<string>(),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowTasks: new Map([
       [
@@ -1715,6 +2352,7 @@ test('native SDK runtime closes projected workflow agents when workflow monitori
   const agentToolUseId = `workflow-agent:${taskId}:${agentId}`
   const pending = {
     activeSubagents: new Set<string>([agentToolUseId]),
+    failedSubagentCalls: new Set<string>(),
     completedWorkflowTasks: new Set<string>(),
     workflowTasks: new Map([
       [
@@ -1857,32 +2495,425 @@ test('workflow journal monitor does not commit started bookkeeping after stop', 
 
 test('native SDK permission allow result carries original input for SDK validation', async () => {
   const runtime = new NativeClaudeRuntime()
-  const turns = Reflect.get(runtime, 'turns')
-  assert.ok(turns instanceof Map)
   const input = { command: 'printf ok' }
   const requests: unknown[] = []
-  turns.set('turn', {
+  const context = { threadId: 'thread', turnId: 'turn' }
+  const current = {
+    context,
+    resolved: false,
     handlers: {
       onPermissionRequest: async (event: unknown) => {
         requests.push(event)
         return { decision: 'accept' }
       },
     },
+  }
+
+  const makeCanUseTool = Reflect.get(runtime, 'makeCanUseTool')
+  assert.equal(typeof makeCanUseTool, 'function')
+  const canUseTool = makeCanUseTool.call(runtime, () => ({ current, lastContext: context }))
+  const result = await canUseTool('Bash', input, {
+    toolUseID: 'tool',
+    signal: new AbortController().signal,
+  })
+  assert.deepEqual(result, { behavior: 'allow', updatedInput: input })
+  assert.equal(requests.length, 1)
+})
+
+test('native SDK approvals carry why Claude asks and how the user answered', async () => {
+  const runtime = new NativeClaudeRuntime()
+  const requests: any[] = []
+  const decisions: string[] = []
+  const context = { threadId: 'thread', turnId: 'turn' }
+  const current = {
+    context,
+    resolved: false,
+    handlers: {
+      onPermissionRequest: async (event: unknown) => {
+        requests.push(event)
+        return { decision: decisions.shift() }
+      },
+    },
+  }
+  const makeCanUseTool = Reflect.get(runtime, 'makeCanUseTool')
+  const canUseTool = makeCanUseTool.call(runtime, () => ({ current, lastContext: context }))
+  const signal = new AbortController().signal
+
+  // Decline refuses only this call; cancel also stops the turn.
+  decisions.push('decline', 'cancel')
+  assert.deepEqual(
+    await canUseTool('Bash', { command: 'rm -rf build' }, { toolUseID: 'tool-1', signal }),
+    { behavior: 'deny', message: 'declined by user' },
+  )
+  assert.deepEqual(
+    await canUseTool('Bash', { command: 'rm -rf build' }, { toolUseID: 'tool-2', signal }),
+    { behavior: 'deny', message: 'cancelled by user', interrupt: true },
+  )
+  assert.equal(requests[0].reason, null)
+  assert.equal(requests[0].mcpServer, null)
+  assert.equal(requests[0].suppressSessionApproval, undefined)
+
+  decisions.push('accept')
+  await canUseTool(
+    'mcp__docs__lookup',
+    { query: 'claude codex' },
+    {
+      toolUseID: 'tool-3',
+      signal,
+      decisionReason: ' Matches an ask rule ',
+      title: 'Claude wants to use lookup',
+      blockedPath: '/repo/notes.md',
+      mcpServer: { name: 'Docs Server', source: 'project' },
+      suppressAlwaysAllowRule: true,
+    },
+  )
+  assert.equal(requests[2].toolUseId, 'tool-3')
+  assert.equal(requests[2].reason, 'Matches an ask rule')
+  assert.equal(requests[2].title, 'Claude wants to use lookup')
+  assert.equal(requests[2].blockedPath, '/repo/notes.md')
+  assert.equal(requests[2].mcpServer, 'Docs Server')
+  assert.equal(requests[2].suppressSessionApproval, true)
+})
+
+test('native SDK approvals pass on Claude suggestions and apply the changes the user chose', async () => {
+  const runtime = new NativeClaudeRuntime()
+  const requests: any[] = []
+  const decisions: unknown[] = []
+  const context = { threadId: 'thread', turnId: 'turn' }
+  const current = {
+    context,
+    resolved: false,
+    handlers: {
+      onPermissionRequest: async (event: unknown) => {
+        requests.push(event)
+        return decisions.shift()
+      },
+    },
+  }
+  const makeCanUseTool = Reflect.get(runtime, 'makeCanUseTool')
+  const canUseTool = makeCanUseTool.call(runtime, () => ({ current, lastContext: context }))
+  const signal = new AbortController().signal
+  const input = { command: 'npm test' }
+  const local = {
+    type: 'addRules',
+    rules: [{ toolName: 'Bash', ruleContent: 'npm test *' }],
+    behavior: 'allow',
+    destination: 'localSettings',
+  }
+  const session = { type: 'addDirectories', directories: ['/repo/docs'], destination: 'session' }
+  const user = { ...local, destination: 'userSettings' }
+  const project = { ...local, destination: 'projectSettings' }
+
+  // The well-formed suggestions reach the approval; a call without any has
+  // none.
+  decisions.push({ decision: 'accept' })
+  await canUseTool('Bash', input, {
+    toolUseID: 'tool-1',
+    signal,
+    suggestions: [local, null, { type: 'addRules' }, session],
+  })
+  assert.deepEqual(requests[0].suggestions, [local, session])
+  decisions.push({ decision: 'accept' })
+  await canUseTool('Bash', input, { toolUseID: 'tool-2', signal })
+  assert.equal('suggestions' in requests[1], false)
+
+  // Claude Code applies what the user chose, to the project's local settings
+  // and the session only; a plain approval applies nothing.
+  decisions.push({
+    decision: 'acceptForSession',
+    updatedPermissions: [local, user, project, session],
+  })
+  assert.deepEqual(
+    await canUseTool('Bash', input, { toolUseID: 'tool-3', signal, suggestions: [local] }),
+    { behavior: 'allow', updatedInput: input, updatedPermissions: [local, session] },
+  )
+  decisions.push({ decision: 'accept', updatedPermissions: [user] })
+  assert.deepEqual(await canUseTool('Bash', input, { toolUseID: 'tool-4', signal }), {
+    behavior: 'allow',
+    updatedInput: input,
   })
 
+  // A call only the user may answer grants no more than itself.
+  decisions.push({ decision: 'accept', updatedPermissions: [local] })
+  assert.deepEqual(
+    await canUseTool('Bash', input, {
+      toolUseID: 'tool-5',
+      signal,
+      requiresUserInteraction: true,
+      suggestions: [local],
+    }),
+    { behavior: 'allow', updatedInput: input },
+  )
+})
+
+test('native SDK auto-denials decline the call and say why', async () => {
+  const runtime = new NativeClaudeRuntime()
+  const events: any[] = []
+  const pending = { handlers: { onEvent: async (event: unknown) => events.push(event) } }
+  const handleSystem = Reflect.get(runtime, 'handleSystem')
+
+  await handleSystem.call(runtime, pending, {
+    subtype: 'permission_denied',
+    tool_name: 'Bash',
+    tool_use_id: 'tool-1',
+    decision_reason_type: 'rule',
+    decision_reason: 'matches a deny rule',
+    message: 'Permission to use Bash has been denied.',
+  })
+  await handleSystem.call(runtime, pending, { subtype: 'permission_denied', tool_name: 'Write' })
+
+  assert.deepEqual(events, [
+    { type: 'tool_denied', toolUseId: 'tool-1' },
+    {
+      type: 'notice',
+      level: 'warning',
+      message: 'Permission denied for Bash: matches a deny rule',
+    },
+    { type: 'notice', level: 'warning', message: 'Permission denied for Write' },
+  ])
+})
+
+test('native SDK classifier denials become a denied auto review of the call', async () => {
+  const runtime = new NativeClaudeRuntime()
+  const events: any[] = []
+  const pending = { handlers: { onEvent: async (event: unknown) => events.push(event) } }
+  const handleSystem = Reflect.get(runtime, 'handleSystem')
+
+  await handleSystem.call(runtime, pending, {
+    subtype: 'permission_denied',
+    tool_name: 'Bash',
+    tool_use_id: 'tool-1',
+    decision_reason_type: 'classifier',
+    decision_reason: ' Deleting the build directory was not requested. ',
+    message: 'Permission to use Bash has been denied.',
+  })
+  await handleSystem.call(runtime, pending, {
+    subtype: 'permission_denied',
+    tool_name: 'Bash',
+    tool_use_id: 'tool-2',
+    decision_reason_type: 'classifier',
+    message: 'Permission to use Bash has been denied.',
+  })
+
+  // No notice: the review card says why.
+  assert.deepEqual(events, [
+    {
+      type: 'tool_denied',
+      toolUseId: 'tool-1',
+      toolName: 'Bash',
+      autoReview: { rationale: 'Deleting the build directory was not requested.' },
+    },
+    {
+      type: 'tool_denied',
+      toolUseId: 'tool-2',
+      toolName: 'Bash',
+      autoReview: { rationale: 'Permission to use Bash has been denied.' },
+    },
+  ])
+})
+
+test('native SDK sessions always launch in an explicit permission mode', () => {
+  const previous = process.env.CLAUDE_CODEX_PERMISSION_MODE
+  delete process.env.CLAUDE_CODEX_PERMISSION_MODE
+  const runtime = new NativeClaudeRuntime()
+  const buildOptions = Reflect.get(runtime, 'buildOptions')
+  const launch = (overrides: Partial<RuntimeTurnContext>): unknown =>
+    buildOptions.call(runtime, {}, nativeTurnContext(overrides), new AbortController(), () => null)
+      .permissionMode
   try {
-    const makeCanUseTool = Reflect.get(runtime, 'makeCanUseTool')
-    assert.equal(typeof makeCanUseTool, 'function')
-    const canUseTool = makeCanUseTool.call(runtime, { threadId: 'thread', turnId: 'turn' }, false)
-    const result = await canUseTool('Bash', input, {
-      toolUseID: 'tool',
-      signal: new AbortController().signal,
-    })
-    assert.deepEqual(result, { behavior: 'allow', updatedInput: input })
-    assert.equal(requests.length, 1)
+    assert.equal(launch({}), 'default')
+    assert.equal(launch({ approvalPolicy: 'untrusted', sandboxMode: 'read-only' }), 'default')
+    assert.equal(
+      launch({ approvalPolicy: 'on-request', sandboxMode: 'workspace-write' }),
+      'default',
+    )
+    assert.equal(
+      launch({ approvalPolicy: 'on-failure', sandboxMode: 'workspace-write' }),
+      'acceptEdits',
+    )
+    assert.equal(launch({ approvalPolicy: 'never', sandboxMode: 'danger-full-access' }), 'default')
+    assert.equal(launch({ planMode: true, approvalPolicy: 'never' }), 'plan')
+    // Auto review switches to auto mode after launch, once the session knows
+    // its model supports it.
+    assert.equal(
+      launch({ approvalPolicy: 'on-request', sandboxMode: 'workspace-write', autoReview: true }),
+      'default',
+    )
+    process.env.CLAUDE_CODEX_PERMISSION_MODE = 'auto'
+    assert.equal(launch({ approvalPolicy: 'on-request' }), 'auto')
   } finally {
-    turns.delete('turn')
+    if (previous === undefined) delete process.env.CLAUDE_CODEX_PERMISSION_MODE
+    else process.env.CLAUDE_CODEX_PERMISSION_MODE = previous
   }
+})
+
+test('native SDK asks only the user may answer reach the App in every mode', async () => {
+  const runtime = new NativeClaudeRuntime()
+  const makeCanUseTool = Reflect.get(runtime, 'makeCanUseTool')
+  const requests: any[] = []
+  const signal = new AbortController().signal
+  const plain = { toolUseID: 'tool', signal }
+  const userOnly = { toolUseID: 'tool', signal, requiresUserInteraction: true }
+  const ask = (context: RuntimeTurnContext) =>
+    makeCanUseTool.call(runtime, () => ({
+      current: {
+        context,
+        resolved: false,
+        handlers: {
+          onPermissionRequest: async (event: unknown) => {
+            requests.push(event)
+            return { decision: 'accept' }
+          },
+        },
+      },
+      lastContext: context,
+    }))
+
+  // Full access answers any other call itself.
+  const fullAccess = nativeTurnContext({
+    approvalPolicy: 'never',
+    sandboxMode: 'danger-full-access',
+  })
+  assert.deepEqual(await ask(fullAccess)('Bash', { command: 'true' }, plain), { behavior: 'allow' })
+  assert.equal(requests.length, 0)
+  assert.deepEqual(await ask(fullAccess)('Bash', { command: 'git push' }, userOnly), {
+    behavior: 'allow',
+    updatedInput: { command: 'git push' },
+  })
+  assert.equal(requests.length, 1)
+  assert.equal(requests[0].requiresUser, true)
+
+  // A read of a readable root needs no approval, unless only the user may
+  // answer it.
+  const readable = nativeTurnContext({
+    approvalPolicy: 'on-request',
+    sandboxMode: 'workspace-write',
+    readableRoots: [process.cwd()],
+  })
+  const file = { file_path: join(process.cwd(), 'package.json') }
+  assert.deepEqual(await ask(readable)('Read', file, plain), { behavior: 'allow' })
+  assert.equal(requests.length, 1)
+  await ask(readable)('Read', file, userOnly)
+  assert.equal(requests.length, 2)
+  assert.equal(requests[1].requiresUser, true)
+
+  // Between turns no standing policy answers it.
+  const between = makeCanUseTool.call(runtime, () => ({ current: null, lastContext: fullAccess }))
+  assert.deepEqual(await between('Bash', { command: 'true' }, plain), { behavior: 'allow' })
+  assert.equal((await between('Bash', { command: 'git push' }, userOnly)).behavior, 'deny')
+  assert.equal(requests.length, 2)
+})
+
+test('native SDK permission request between turns falls back to the standing policy', async () => {
+  const runtime = new NativeClaudeRuntime()
+  const makeCanUseTool = Reflect.get(runtime, 'makeCanUseTool')
+  const options = { toolUseID: 'tool', signal: new AbortController().signal }
+  const ask = (lastContext: RuntimeTurnContext) =>
+    makeCanUseTool.call(runtime, () => ({ current: null, lastContext }))
+  assert.deepEqual(
+    await ask(nativeTurnContext({ approvalPolicy: 'never' }))('Bash', { command: 'true' }, options),
+    { behavior: 'allow' },
+  )
+  assert.equal(
+    (
+      await ask(
+        nativeTurnContext({ approvalPolicy: 'on-request', sandboxMode: 'workspace-write' }),
+      )('Bash', { command: 'true' }, options)
+    ).behavior,
+    'deny',
+  )
+  assert.equal(
+    (await ask(nativeTurnContext({ approvalPolicy: 'never' }))('AskUserQuestion', {}, options))
+      .behavior,
+    'deny',
+  )
+})
+
+test('native SDK plan mode carries ExitPlanMode and AskUserQuestion to the App', async () => {
+  const runtime = new NativeClaudeRuntime()
+  const makeCanUseTool = Reflect.get(runtime, 'makeCanUseTool')
+  const options = { toolUseID: 'exit-1', signal: new AbortController().signal }
+  // Full Access must not loosen plan mode.
+  const context = nativeTurnContext({
+    planMode: true,
+    approvalPolicy: 'never',
+    sandboxMode: 'danger-full-access',
+  })
+  const events: unknown[] = []
+  const questions: unknown[] = []
+  const approvals: unknown[] = []
+  const current = {
+    context,
+    resolved: false,
+    handlers: {
+      onEvent: async (event: unknown) => {
+        events.push(event)
+      },
+      onPermissionRequest: async (event: unknown) => {
+        approvals.push(event)
+        return { decision: 'accept' }
+      },
+      onUserInputRequest: async (event: any) => {
+        questions.push(event)
+        return { answers: { [event.questions[0].id]: { answers: ['API Key'] } } }
+      },
+    },
+  }
+  const canUseTool = makeCanUseTool.call(runtime, () => ({ current, lastContext: context }))
+
+  // The finished plan becomes one proposed_plan event; the refusal, without
+  // an interrupt, lets the turn complete so the App can offer to implement.
+  const plan = '## Plan\n\n1. Inspect\n2. Implement'
+  const exit = await canUseTool(
+    'ExitPlanMode',
+    { plan: `${plan}\n`, planFilePath: '/tmp/plan.md' },
+    options,
+  )
+  assert.equal(exit.behavior, 'deny')
+  assert.equal(exit.interrupt, undefined)
+  assert.match(exit.message, /delivered to the user/)
+  assert.deepEqual(events, [{ type: 'proposed_plan', toolUseId: 'exit-1', text: plan }])
+
+  // No plan text yet: nothing reaches the App.
+  const empty = await canUseTool('ExitPlanMode', { plan: '  ' }, options)
+  assert.equal(empty.behavior, 'deny')
+  assert.match(empty.message, /plan file/)
+  assert.equal(events.length, 1)
+
+  // AskUserQuestion still reaches the user.
+  const asked = await canUseTool(
+    'AskUserQuestion',
+    {
+      questions: [
+        {
+          question: 'Which auth?',
+          header: 'Auth',
+          options: [
+            { label: 'OAuth', description: 'Browser sign-in' },
+            { label: 'API Key', description: 'Static key' },
+          ],
+          multiSelect: false,
+        },
+      ],
+    },
+    { ...options, toolUseID: 'ask-1' },
+  )
+  assert.equal(questions.length, 1)
+  assert.equal(asked.behavior, 'deny')
+  assert.match(asked.message, /API Key/)
+
+  // Anything else that needs an approval is refused without asking.
+  const bash = await canUseTool('Bash', { command: 'rm -rf build' }, options)
+  assert.equal(bash.behavior, 'deny')
+  assert.match(bash.message, /plan mode/)
+  assert.equal(approvals.length, 0)
+
+  // Outside plan mode ExitPlanMode is an ordinary approval.
+  const plain = { ...current, context: nativeTurnContext({ approvalPolicy: 'on-request' }) }
+  const outside = makeCanUseTool.call(runtime, () => ({ current: plain, lastContext: context }))
+  assert.equal((await outside('ExitPlanMode', { plan }, options)).behavior, 'allow')
+  assert.equal(approvals.length, 1)
+  assert.equal(events.length, 1)
 })
 
 test('HTTP agent runtime streams agentapi-compatible message updates', async () => {
@@ -2128,7 +3159,9 @@ test('claude-p runtime runs each turn in its own cwd', async () => {
   const runtime = new ClaudePTranscriptRuntime({
     command,
     extraArgs: [],
-    timeoutMs: 2_000,
+    // Generous: node cold starts can take seconds when the suite runs in
+    // parallel, and the fake answers as soon as it is up.
+    timeoutMs: 20_000,
     skipPermissions: false,
     resume: false,
   })
@@ -2181,6 +3214,172 @@ test('claude-p runtime runs each turn in its own cwd', async () => {
   }
 })
 
+test('claude-p runtime turns auto-memory off only for threads the memories mapping keeps from it', async () => {
+  const tmp = await mkdtemp(join(tmpdir(), 'claude-codex-claude-p-memory-test-'))
+  const command = join(tmp, 'fake-claude-p.mjs')
+  await writeFile(
+    command,
+    [
+      '#!/usr/bin/env node',
+      'const value = process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY ?? "unset";',
+      'console.log(JSON.stringify({ result: value, session_id: null, is_error: false }));',
+    ].join('\n'),
+  )
+  await chmod(command, 0o755)
+  const runtime = new ClaudePTranscriptRuntime({
+    command,
+    extraArgs: [],
+    timeoutMs: 20_000,
+    skipPermissions: false,
+    resume: false,
+  })
+  const run = async (autoMemory: boolean | undefined): Promise<string> => {
+    let text = ''
+    await runtime.runTurn(
+      nativeTurnContext({
+        threadId: `thread-${String(autoMemory)}`,
+        cwd: tmp,
+        ...(autoMemory === undefined ? {} : { autoMemory }),
+      }),
+      {
+        onEvent: (event) => {
+          if (event.type === 'text_delta') text += event.delta
+        },
+        onPermissionRequest: async () => ({ decision: 'accept' }),
+      },
+    )
+    return text
+  }
+  const previous = process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY
+  delete process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY
+  try {
+    // Without the mapping (undefined) the CLI gets nothing extra.
+    assert.deepEqual(await Promise.all([run(undefined), run(false), run(true)]), [
+      'unset',
+      '1',
+      'unset',
+    ])
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY
+    else process.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY = previous
+    await rm(tmp, { recursive: true, force: true })
+  }
+})
+
+test('claude-p runtime passes the auto-compact window only when the thread has one', async () => {
+  const tmp = await mkdtemp(join(tmpdir(), 'claude-codex-claude-p-compact-test-'))
+  const command = join(tmp, 'fake-claude-p.mjs')
+  await writeFile(
+    command,
+    [
+      '#!/usr/bin/env node',
+      'const value = process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW ?? "unset";',
+      'console.log(JSON.stringify({ result: value, session_id: null, is_error: false }));',
+    ].join('\n'),
+  )
+  await chmod(command, 0o755)
+  const runtime = new ClaudePTranscriptRuntime({
+    command,
+    extraArgs: [],
+    timeoutMs: 20_000,
+    skipPermissions: false,
+    resume: false,
+  })
+  const run = async (autoCompactWindow: number | null): Promise<string> => {
+    let text = ''
+    await runtime.runTurn(
+      nativeTurnContext({
+        threadId: `thread-${String(autoCompactWindow)}`,
+        cwd: tmp,
+        autoCompactWindow,
+      }),
+      {
+        onEvent: (event) => {
+          if (event.type === 'text_delta') text += event.delta
+        },
+        onPermissionRequest: async () => ({ decision: 'accept' }),
+      },
+    )
+    return text
+  }
+  const previous = process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW
+  delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW
+  try {
+    assert.deepEqual(await Promise.all([run(null), run(180_000)]), ['unset', '180000'])
+  } finally {
+    if (previous === undefined) delete process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW
+    else process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW = previous
+    await rm(tmp, { recursive: true, force: true })
+  }
+})
+
+test('claude-p runtime keeps the tools a thread must not have from Claude', async () => {
+  const tmp = await mkdtemp(join(tmpdir(), 'claude-codex-claude-p-tools-test-'))
+  const command = join(tmp, 'fake-claude-p.mjs')
+  await writeFile(
+    command,
+    [
+      '#!/usr/bin/env node',
+      'const args = process.argv.slice(2);',
+      'const flag = (name) => (args.includes(name) ? args[args.indexOf(name) + 1] : null);',
+      'const result = JSON.stringify({ allowed: flag("--allowedTools"), disallowed: flag("--disallowedTools") });',
+      'console.log(JSON.stringify({ result, session_id: null, is_error: false }));',
+    ].join('\n'),
+  )
+  await chmod(command, 0o755)
+  const runtime = new ClaudePTranscriptRuntime({
+    command,
+    extraArgs: [],
+    timeoutMs: 20_000,
+    skipPermissions: false,
+    resume: false,
+  })
+  const run = async (
+    name: string,
+    overrides: Partial<RuntimeTurnContext>,
+  ): Promise<{ allowed: string | null; disallowed: string | null }> => {
+    let text = ''
+    await runtime.runTurn(
+      nativeTurnContext({ threadId: `thread-${name}`, cwd: tmp, ...overrides }),
+      {
+        onEvent: (event) => {
+          if (event.type === 'text_delta') text += event.delta
+        },
+        onPermissionRequest: async () => ({ decision: 'accept' }),
+      },
+    )
+    return JSON.parse(text)
+  }
+  try {
+    const [readOnly, readOnlyOff, allowList, onlyDenied] = await Promise.all([
+      run('read-only', { sandboxMode: 'read-only' }),
+      // Web search off on a read-only thread: WebSearch is neither
+      // pre-approved nor left to Claude.
+      run('read-only-off', {
+        sandboxMode: 'read-only',
+        disallowedTools: ['WebSearch', 'mcp__docs__search'],
+      }),
+      run('allow-list', {
+        allowedTools: ['WebSearch', 'Bash(git status:*)'],
+        disallowedTools: ['WebSearch'],
+      }),
+      run('only-denied', { allowedTools: ['WebSearch'], disallowedTools: ['WebSearch'] }),
+    ])
+    assert.deepEqual(readOnly, {
+      allowed: 'Read,Glob,Grep,WebSearch,WebFetch,TodoWrite,Task',
+      disallowed: null,
+    })
+    assert.deepEqual(readOnlyOff, {
+      allowed: 'Read,Glob,Grep,WebFetch,TodoWrite,Task',
+      disallowed: 'WebSearch,mcp__docs__search',
+    })
+    assert.deepEqual(allowList, { allowed: 'Bash(git status:*)', disallowed: 'WebSearch' })
+    assert.deepEqual(onlyDenied, { allowed: null, disallowed: 'WebSearch' })
+  } finally {
+    await rm(tmp, { recursive: true, force: true })
+  }
+})
+
 test('claude-p runtime timeout terminates spawned process tree', async () => {
   const tmp = await mkdtemp(join(tmpdir(), 'claude-codex-claude-p-timeout-test-'))
   const command = join(tmp, 'hanging-claude-p.mjs')
@@ -2200,7 +3399,8 @@ test('claude-p runtime timeout terminates spawned process tree', async () => {
   const runtime = new ClaudePTranscriptRuntime({
     command,
     extraArgs: [],
-    timeoutMs: 1_000,
+    // Long enough for a loaded machine to start the fake and its grandchild.
+    timeoutMs: 3_000,
     skipPermissions: false,
     resume: false,
   })
@@ -2475,21 +3675,23 @@ test('HTTP agent runtime keeps recoverable SSE fallback out of the conversation'
 test('agentapi runtime polls running terminal output before final status-only screen', async () => {
   let status: 'running' | 'stable' = 'stable'
   let messages: Array<{ id: number; role: 'agent'; content: string; time: string }> = []
+  let sawRunningScreen = false
   const server = http.createServer((req, res) => {
     if (req.method === 'GET' && req.url === '/messages') {
+      // The screen settles to a status-only line once the runtime has read
+      // the running screen, whatever its poll timing.
+      if (status === 'running' && messages.length > 0) sawRunningScreen = true
       res.setHeader('content-type', 'application/json')
       res.end(JSON.stringify({ messages }))
       return
     }
     if (req.method === 'GET' && req.url === '/status') {
-      res.setHeader('content-type', 'application/json')
-      res.end(JSON.stringify({ status }))
-      return
-    }
-    if (req.method === 'POST' && req.url === '/message') {
-      req.resume()
-      status = 'running'
-      setTimeout(() => {
+      if (sawRunningScreen) {
+        messages = [
+          { id: 1, role: 'agent', content: '✻ Cooked for 1s', time: new Date().toISOString() },
+        ]
+        status = 'stable'
+      } else if (status === 'running') {
         messages = [
           {
             id: 1,
@@ -2498,13 +3700,14 @@ test('agentapi runtime polls running terminal output before final status-only sc
             time: new Date().toISOString(),
           },
         ]
-      }, 20)
-      setTimeout(() => {
-        messages = [
-          { id: 1, role: 'agent', content: '✻ Cooked for 1s', time: new Date().toISOString() },
-        ]
-        status = 'stable'
-      }, 80)
+      }
+      res.setHeader('content-type', 'application/json')
+      res.end(JSON.stringify({ status }))
+      return
+    }
+    if (req.method === 'POST' && req.url === '/message') {
+      req.resume()
+      status = 'running'
       res.setHeader('content-type', 'application/json')
       res.end(JSON.stringify({ ok: true }))
       return

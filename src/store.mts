@@ -1,7 +1,17 @@
 import { mkdirSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { join } from 'node:path'
+import { currentProcessOwner, otherProcessRunning } from './process-owner.mjs'
 import type {
+  ClaudeCheckpoint,
+  ClaudeResumePoint,
+  DynamicToolSpec,
+  GitInfo,
+  ImportHistoryRecord,
+  ProjectRecord,
+  QueuedSubmission,
+  ThreadAttachmentRecord,
+  ThreadGoal,
   ThreadItem,
   ThreadRecord,
   ThreadSectionAppearance,
@@ -10,7 +20,7 @@ import type {
   TurnRecord,
   TurnStatus,
 } from './types.mjs'
-import { adapterHome, jsonClone, nowSeconds } from './util.mjs'
+import { adapterHome, jsonClone, newId, nowSeconds } from './util.mjs'
 
 const require = createRequire(import.meta.url)
 
@@ -19,9 +29,81 @@ export const PINNED_SECTION_NAME = 'Pinned'
 
 type DatabaseSync = any
 
+// How long a statement waits for another connection's lock before SQLite
+// gives up with "database is locked". Without a wait, anything that reads the
+// file at the wrong moment (a backup, a sqlite3 shell, a status script) fails
+// whichever turn happens to write then. Python's sqlite3 uses the same 5s.
+const DEFAULT_BUSY_TIMEOUT_MS = 5_000
+
+function busyTimeoutMs(): number {
+  const raw = process.env.CLAUDE_CODEX_STATE_DB_TIMEOUT_MS?.trim()
+  if (!raw) return DEFAULT_BUSY_TIMEOUT_MS
+  const value = Number(raw)
+  return Number.isInteger(value) && value >= 0 ? value : DEFAULT_BUSY_TIMEOUT_MS
+}
+
 function openDatabase(path: string): DatabaseSync {
-  const sqlite = require('node:sqlite') as { DatabaseSync: new (filename: string) => DatabaseSync }
-  return new sqlite.DatabaseSync(path)
+  const sqlite = require('node:sqlite') as {
+    DatabaseSync: new (filename: string, options?: { timeout?: number }) => DatabaseSync
+  }
+  return new sqlite.DatabaseSync(path, { timeout: busyTimeoutMs() })
+}
+
+// The terminal form of a turn. completeTurn writes it; a caller whose write
+// the store refused still needs it to tell the client the turn ended.
+export function settledTurn(
+  turn: TurnRecord,
+  status: TurnStatus,
+  error: unknown | null = null,
+): TurnRecord {
+  const completedAt = nowSeconds()
+  return {
+    ...turn,
+    status,
+    completedAt,
+    durationMs: turn.startedAt == null ? null : Math.max(0, (completedAt - turn.startedAt) * 1000),
+    error,
+  }
+}
+
+const PROJECT_SELECT = `SELECT p.*, (
+  SELECT MAX(t.updated_at) FROM threads t WHERE t.project_id = p.id AND t.archived = 0
+) AS recency_at FROM projects p`
+
+// A LIKE pattern matching the text anywhere, with `\` as the escape.
+function likePattern(text: string): string {
+  return `%${text.replace(/[\\%_]/g, '\\$&')}%`
+}
+
+function checkpointFrom(sessionId: unknown, messageUuid: unknown): ClaudeCheckpoint | null {
+  return typeof sessionId === 'string' && typeof messageUuid === 'string'
+    ? { sessionId, messageUuid }
+    : null
+}
+
+function serializeResumePoint(point: ClaudeResumePoint | null): string | null {
+  return point == null ? null : JSON.stringify(point)
+}
+
+function parseResumePoint(json: unknown): ClaudeResumePoint | null {
+  if (typeof json !== 'string') return null
+  try {
+    const value = JSON.parse(json)
+    return value === 'new' ? 'new' : checkpointFrom(value?.sessionId, value?.messageUuid)
+  } catch {
+    return null
+  }
+}
+
+function parseGitInfo(json: unknown): GitInfo | null {
+  if (typeof json !== 'string') return null
+  try {
+    const value = JSON.parse(json)
+    const field = (key: string) => (typeof value?.[key] === 'string' ? value[key] : null)
+    return { sha: field('sha'), branch: field('branch'), originUrl: field('originUrl') }
+  } catch {
+    return null
+  }
 }
 
 export class SessionStore {
@@ -78,6 +160,75 @@ export class SessionStore {
         updated_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_thread_sections_created ON thread_sections(created_at, id);
+      CREATE TABLE IF NOT EXISTS thread_goals (
+        thread_id TEXT PRIMARY KEY,
+        goal_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS thread_queues (
+        thread_id TEXT PRIMARY KEY,
+        items_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS thread_dynamic_tools (
+        thread_id TEXT PRIMARY KEY,
+        tools_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS thread_injected_items (
+        thread_id TEXT PRIMARY KEY,
+        items_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS projects (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        roots_json TEXT NOT NULL,
+        metadata_json TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        deleted INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS thread_attachments (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL,
+        attachment_type TEXT NOT NULL,
+        identity_key TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        UNIQUE(thread_id, attachment_type, identity_key)
+      );
+      CREATE INDEX IF NOT EXISTS idx_thread_attachments_identity
+        ON thread_attachments(attachment_type, identity_key, thread_id);
+      CREATE TABLE IF NOT EXISTS import_histories (
+        id TEXT PRIMARY KEY,
+        provider_id TEXT,
+        completed_at_ms INTEGER NOT NULL,
+        successes_json TEXT NOT NULL,
+        failures_json TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS leader_threads (
+        thread_id TEXT PRIMARY KEY,
+        leader_thread_id TEXT NOT NULL,
+        seen_turn_id TEXT,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_leader_threads_leader
+        ON leader_threads(leader_thread_id, created_at);
+      CREATE TABLE IF NOT EXISTS thread_inherited_turns (
+        thread_id TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        started_at INTEGER,
+        completed_at INTEGER,
+        duration_ms INTEGER,
+        items_json TEXT NOT NULL,
+        diff TEXT NOT NULL DEFAULT '',
+        error_json TEXT,
+        root_turn_id TEXT,
+        claude_session_id TEXT,
+        claude_message_uuid TEXT,
+        PRIMARY KEY (thread_id, position)
+      );
     `)
     this.ensureColumn('threads', 'is_pinned', 'INTEGER NOT NULL DEFAULT 0')
     this.ensureColumn('threads', 'section_id', 'TEXT')
@@ -90,6 +241,10 @@ export class SessionStore {
     this.ensureColumn('threads', 'approval_policy', 'TEXT')
     this.ensureColumn('threads', 'sandbox_mode', 'TEXT')
     this.ensureColumn('threads', 'permission_profile_id', 'TEXT')
+    // The App's collaboration mode ('plan' / 'default'); NULL until named.
+    this.ensureColumn('threads', 'collaboration_mode', 'TEXT')
+    // The App's approvals reviewer ('user' / 'auto_review'); NULL until named.
+    this.ensureColumn('threads', 'approvals_reviewer', 'TEXT')
     this.ensureColumn('threads', 'ephemeral', 'INTEGER NOT NULL DEFAULT 0')
     this.ensureColumn('threads', 'thread_source', 'TEXT')
     this.ensureColumn('threads', 'agent_role', 'TEXT')
@@ -104,6 +259,36 @@ export class SessionStore {
     // Real Codex session id for runtime_backend='codex' threads (returned
     // by `codex exec` as thread.started.thread_id). NULL until first turn.
     this.ensureColumn('threads', 'codex_session_id', 'TEXT')
+    // Claude transcript checkpoints for thread/rollback, thread/revert and
+    // thread/fork: see setTurnCheckpoint and rewindClaudeSession.
+    this.ensureColumn('threads', 'claude_resume_at', 'TEXT')
+    this.ensureColumn('threads', 'claude_fork_session_id', 'TEXT')
+    this.ensureColumn('threads', 'claude_fork_message_uuid', 'TEXT')
+    this.ensureColumn('threads', 'claude_fork_new_session', 'INTEGER NOT NULL DEFAULT 0')
+    this.ensureColumn('turns', 'claude_session_id', 'TEXT')
+    this.ensureColumn('turns', 'claude_message_uuid', 'TEXT')
+    // TurnRecord.rootTurnId; NULL when the turn is its own root.
+    this.ensureColumn('turns', 'root_turn_id', 'TEXT')
+    // The server that last wrote the turn (see process-owner.mts), so startup
+    // recovery leaves alone what another live server is still running.
+    this.ensureColumn('turns', 'owner_pid', 'INTEGER')
+    this.ensureColumn('turns', 'owner_started', 'TEXT')
+    // Project membership; written only by setThreadProject and deleteProject.
+    this.ensureColumn('threads', 'project_id', 'TEXT')
+    // Model process profile identity a thread is pinned to (model-profiles.mts).
+    this.ensureColumn('threads', 'model_profile_fingerprint', 'TEXT')
+    this.db.exec('CREATE INDEX IF NOT EXISTS idx_threads_project ON threads(project_id)')
+    // Codex's per-thread memory mode; set when the thread is created, then
+    // only by setThreadMemoryMode.
+    this.ensureColumn('threads', 'memory_mode', 'TEXT')
+    // Codex GitInfo as JSON; written only by setThreadGitInfo.
+    this.ensureColumn('threads', 'git_info_json', 'TEXT')
+    // A fork's copy of the history it was forked with (thread_inherited_turns):
+    // NULL until known, 1 once copied, 2 when a fork made before forks kept
+    // their history cannot tell where it branched off. The base is where
+    // Claude's context stands before the first inherited turn.
+    this.ensureColumn('threads', 'inherited_history', 'INTEGER')
+    this.ensureColumn('threads', 'inherited_base_json', 'TEXT')
     this.ensurePinnedSection()
     this.migrateLegacyPinState()
     this.sanitizeLegacyEnumColumns()
@@ -189,13 +374,14 @@ export class SessionStore {
       .prepare(`
         INSERT INTO threads (
           id, session_id, forked_from_id, is_pinned, section_id, section_entered_at, section_position,
-          preview, name, archived, cwd, model, reasoning_effort, model_provider, claude_session_id,
+          preview, name, archived, cwd, model, model_profile_fingerprint, reasoning_effort, model_provider, claude_session_id,
           source, created_at, updated_at, status_json,
           approval_policy, sandbox_mode, permission_profile_id, ephemeral, thread_source, agent_role, agent_nickname,
-          base_instructions, developer_instructions, personality, runtime_backend, codex_session_id
+          base_instructions, developer_instructions, personality, runtime_backend, codex_session_id,
+          memory_mode, collaboration_mode, approvals_reviewer
         ) VALUES (
           ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
         ON CONFLICT(id) DO UPDATE SET
           session_id=excluded.session_id,
@@ -209,6 +395,7 @@ export class SessionStore {
           archived=excluded.archived,
           cwd=excluded.cwd,
           model=excluded.model,
+          model_profile_fingerprint=excluded.model_profile_fingerprint,
           reasoning_effort=excluded.reasoning_effort,
           model_provider=excluded.model_provider,
           claude_session_id=excluded.claude_session_id,
@@ -226,7 +413,9 @@ export class SessionStore {
           developer_instructions=excluded.developer_instructions,
           personality=excluded.personality,
           runtime_backend=excluded.runtime_backend,
-          codex_session_id=excluded.codex_session_id
+          codex_session_id=excluded.codex_session_id,
+          collaboration_mode=excluded.collaboration_mode,
+          approvals_reviewer=excluded.approvals_reviewer
       `)
       .run(
         thread.id,
@@ -241,6 +430,7 @@ export class SessionStore {
         thread.archived ? 1 : 0,
         thread.cwd,
         thread.model,
+        thread.modelProfileFingerprint ?? null,
         thread.reasoningEffort,
         thread.modelProvider,
         thread.claudeSessionId,
@@ -260,6 +450,9 @@ export class SessionStore {
         thread.personality,
         thread.runtimeBackend,
         thread.codexSessionId,
+        thread.memoryMode ?? null,
+        thread.collaborationMode ?? null,
+        thread.approvalsReviewer ?? null,
       )
   }
 
@@ -280,6 +473,12 @@ export class SessionStore {
       ancestorThreadId?: string | null
       sourceKinds?: string[]
       sectionId?: string | null | undefined
+      projectId?: string | null | undefined
+      // Keeps threads whose name, preview or stored items contain the text.
+      // A prefilter: a match inside item JSON may be a key, not visible text.
+      searchTerm?: string | undefined
+      // Leaves out threads that have no turn and no preview yet.
+      excludeEmpty?: boolean
       sortKey?: 'created_at' | 'updated_at' | 'recency_at' | 'section_position'
       sortDirection?: 'asc' | 'desc'
     } = {},
@@ -297,13 +496,25 @@ export class SessionStore {
         ? 'COALESCE(t.section_position, t.created_at)'
         : `t.${sortKey === 'created_at' ? 'created_at' : 'updated_at'}`
     const sortDirection = options.sortDirection === 'asc' ? 'ASC' : 'DESC'
+    // A cursor is "<sort value>:<thread id>" of the last thread a page showed.
+    // Sort values are whole seconds, so the id keeps the rest of that second's
+    // threads on the next page. A bare value skips them all.
+    const separator = options.cursor ? options.cursor.indexOf(':') : -1
     const cursor = options.cursor
-      ? Number(options.cursor)
+      ? Number(separator < 0 ? options.cursor : options.cursor.slice(0, separator))
       : sortDirection === 'ASC'
         ? -1
         : Number.MAX_SAFE_INTEGER
-    const where = ['t.archived = ?', `${sortExpression} ${sortDirection === 'ASC' ? '>' : '<'} ?`]
-    const args: unknown[] = [archived, cursor]
+    const cursorId = options.cursor && separator >= 0 ? options.cursor.slice(separator + 1) : null
+    const comparison = sortDirection === 'ASC' ? '>' : '<'
+    const where = [
+      't.archived = ?',
+      cursorId == null
+        ? `${sortExpression} ${comparison} ?`
+        : `(${sortExpression} ${comparison} ? OR (${sortExpression} = ? AND t.id ${comparison} ?))`,
+    ]
+    const args: unknown[] =
+      cursorId == null ? [archived, cursor] : [archived, cursor, cursor, cursorId]
     if (options.isPinned != null) {
       where.push('t.is_pinned = ?')
       args.push(options.isPinned ? 1 : 0)
@@ -315,6 +526,25 @@ export class SessionStore {
         where.push('t.section_id = ?')
         args.push(options.sectionId)
       }
+    }
+    if (options.projectId !== undefined) {
+      if (options.projectId === null) {
+        where.push('t.project_id IS NULL')
+      } else {
+        where.push('t.project_id = ?')
+        args.push(options.projectId)
+      }
+    }
+    if (options.searchTerm) {
+      const text = likePattern(options.searchTerm)
+      const json = likePattern(JSON.stringify(options.searchTerm).slice(1, -1))
+      where.push(
+        `(t.name LIKE ? ESCAPE '\\' OR t.preview LIKE ? ESCAPE '\\' OR EXISTS (
+           SELECT 1 FROM turns u WHERE u.thread_id = t.id AND u.items_json LIKE ? ESCAPE '\\')
+           OR EXISTS (SELECT 1 FROM thread_inherited_turns h
+             WHERE h.thread_id = t.id AND h.items_json LIKE ? ESCAPE '\\'))`,
+      )
+      args.push(text, text, json, json)
     }
     const parentThreadId = options.parentThreadId ?? null
     const ancestorThreadId = options.ancestorThreadId ?? null
@@ -368,6 +598,18 @@ export class SessionStore {
     const topologyQuery =
       parentThreadId != null || ancestorThreadId != null || hasSubagentSourceFilter
     if (!options.includeEphemeral && !topologyQuery) where.push('t.ephemeral = 0')
+    // Codex lists a thread once it has a preview, except in the archive, a
+    // chosen section or a topology query. A turn counts too, since an image or
+    // handoff turn leaves the preview empty.
+    // App rule: prewarmed-threads
+    if (
+      options.excludeEmpty &&
+      !topologyQuery &&
+      archived === 0 &&
+      typeof options.sectionId !== 'string'
+    ) {
+      where.push("(t.preview <> '' OR EXISTS (SELECT 1 FROM turns u WHERE u.thread_id = t.id))")
+    }
 
     const cwdList = Array.isArray(options.cwd) ? options.cwd : options.cwd ? [options.cwd] : []
     if (cwdList.length > 0) {
@@ -567,6 +809,343 @@ export class SessionStore {
     for (const [position, threadId] of threadIds.entries()) update.run(position, threadId)
   }
 
+  // Live projects in `sortKey` order. Recency puts projects without unarchived
+  // threads last in either direction, as Codex does.
+  listProjects(
+    sortKey: 'position' | 'recencyAt',
+    sortDirection: 'asc' | 'desc',
+    limit: number,
+    offset: number,
+  ): ProjectRecord[] {
+    const direction = sortDirection === 'asc' ? 'ASC' : 'DESC'
+    const order =
+      sortKey === 'recencyAt'
+        ? `recency_at IS NULL, recency_at ${direction}, p.position ASC, p.id ASC`
+        : `p.position ${direction}, p.id ${direction}`
+    const rows = this.db
+      .prepare(`${PROJECT_SELECT} WHERE p.deleted = 0 ORDER BY ${order} LIMIT ? OFFSET ?`)
+      .all(limit, offset)
+    return rows.map((row: unknown) => this.rowToProject(row))
+  }
+
+  getProject(id: string): ProjectRecord | null {
+    const row = this.db.prepare(`${PROJECT_SELECT} WHERE p.id = ? AND p.deleted = 0`).get(id)
+    return row ? this.rowToProject(row) : null
+  }
+
+  // One project per idempotency key: a retried create returns the project the
+  // first call made (`created: false`), and the key of a deleted project stays
+  // spent. New projects go last.
+  createProject(
+    id: string,
+    idempotencyKey: string,
+    fields: Pick<ProjectRecord, 'name' | 'roots' | 'metadata'>,
+  ): { project: ProjectRecord; created: boolean } {
+    return this.transaction(() => {
+      const existing = this.db
+        .prepare('SELECT id, deleted FROM projects WHERE idempotency_key = ?')
+        .get(idempotencyKey) as { id: string; deleted: number } | undefined
+      if (existing && Number(existing.deleted) === 1)
+        throw new Error(`idempotency key refers to deleted project: ${existing.id}`)
+      if (existing)
+        return { project: this.getProject(String(existing.id)) as ProjectRecord, created: false }
+      const { next } = this.db
+        .prepare('SELECT COALESCE(MAX(position) + 1, 0) AS next FROM projects WHERE deleted = 0')
+        .get() as { next: number }
+      const now = nowSeconds()
+      this.db
+        .prepare(
+          `INSERT INTO projects
+           (id, name, roots_json, metadata_json, position, idempotency_key, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          id,
+          fields.name,
+          JSON.stringify(fields.roots),
+          JSON.stringify(fields.metadata),
+          Number(next),
+          idempotencyKey,
+          now,
+          now,
+        )
+      return { project: this.getProject(id) as ProjectRecord, created: true }
+    })
+  }
+
+  // Replaces the fields given; metadata is replaced as a whole.
+  updateProject(
+    id: string,
+    fields: Partial<Pick<ProjectRecord, 'name' | 'roots' | 'metadata'>>,
+  ): ProjectRecord {
+    const project = this.getProject(id)
+    if (!project) throw new Error(`project not found: ${id}`)
+    this.db
+      .prepare(
+        `UPDATE projects SET name = ?, roots_json = ?, metadata_json = ?, updated_at = ?
+         WHERE id = ?`,
+      )
+      .run(
+        fields.name ?? project.name,
+        JSON.stringify(fields.roots ?? project.roots),
+        JSON.stringify(fields.metadata ?? project.metadata),
+        nowSeconds(),
+        id,
+      )
+    return this.getProject(id) as ProjectRecord
+  }
+
+  // Leaves a tombstone so the idempotency key stays spent, and unassigns the
+  // project's threads. Returns their ids.
+  deleteProject(id: string): string[] {
+    if (!this.getProject(id)) throw new Error(`project not found: ${id}`)
+    return this.transaction(() => {
+      const threadIds = (
+        this.db.prepare('SELECT id FROM threads WHERE project_id = ?').all(id) as Array<{
+          id: string
+        }>
+      ).map((row) => String(row.id))
+      this.db.prepare('UPDATE threads SET project_id = NULL WHERE project_id = ?').run(id)
+      this.db
+        .prepare('UPDATE projects SET deleted = 1, updated_at = ? WHERE id = ?')
+        .run(nowSeconds(), id)
+      this.renumberProjects(this.projectIds())
+      return threadIds
+    })
+  }
+
+  // Moves a project in front of `beforeProjectId`, or last when that is null.
+  moveProject(id: string, beforeProjectId: string | null): void {
+    if (!this.getProject(id)) throw new Error(`project not found: ${id}`)
+    if (beforeProjectId != null && !this.getProject(beforeProjectId))
+      throw new Error(`project not found: ${beforeProjectId}`)
+    if (beforeProjectId === id) return
+    const ids = this.projectIds().filter((projectId) => projectId !== id)
+    const before = beforeProjectId == null ? -1 : ids.indexOf(beforeProjectId)
+    ids.splice(before >= 0 ? before : ids.length, 0, id)
+    this.transaction(() => this.renumberProjects(ids))
+  }
+
+  // Returns whether the thread's project changed.
+  setThreadProject(threadId: string, projectId: string | null): boolean {
+    const result = this.db
+      .prepare('UPDATE threads SET project_id = ? WHERE id = ? AND project_id IS NOT ?')
+      .run(projectId, threadId, projectId)
+    return Number(result.changes) > 0
+  }
+
+  // Like the project, outside upsertThread: a turn saving the thread record it
+  // read before the switch must not undo it.
+  setThreadMemoryMode(threadId: string, mode: 'enabled' | 'disabled'): void {
+    this.db.prepare('UPDATE threads SET memory_mode = ? WHERE id = ?').run(mode, threadId)
+  }
+
+  // Returns whether the thread's git info changed.
+  setThreadGitInfo(threadId: string, gitInfo: GitInfo | null): boolean {
+    const json = gitInfo ? JSON.stringify(gitInfo) : null
+    const result = this.db
+      .prepare('UPDATE threads SET git_info_json = ? WHERE id = ? AND git_info_json IS NOT ?')
+      .run(json, threadId, json)
+    return Number(result.changes) > 0
+  }
+
+  private projectIds(): string[] {
+    return (
+      this.db
+        .prepare('SELECT id FROM projects WHERE deleted = 0 ORDER BY position, id')
+        .all() as Array<{ id: string }>
+    ).map((row) => String(row.id))
+  }
+
+  private renumberProjects(projectIds: string[]): void {
+    const update = this.db.prepare('UPDATE projects SET position = ? WHERE id = ?')
+    for (const [position, projectId] of projectIds.entries()) update.run(position, projectId)
+  }
+
+  private transaction<T>(body: () => T): T {
+    this.db.exec('BEGIN IMMEDIATE')
+    try {
+      const result = body()
+      this.db.exec('COMMIT')
+      return result
+    } catch (error) {
+      try {
+        this.db.exec('ROLLBACK')
+      } catch {}
+      throw error
+    }
+  }
+
+  // Adds the attachment unless the thread already has one with its type and
+  // key, which is returned unchanged instead.
+  addThreadAttachment(
+    threadId: string,
+    attachment: Omit<ThreadAttachmentRecord, 'createdAt'>,
+  ): { attachment: ThreadAttachmentRecord; created: boolean } {
+    return this.transaction(() => {
+      const existing = this.threadAttachment(
+        threadId,
+        attachment.attachmentType,
+        attachment.identityKey,
+      )
+      if (existing) return { attachment: existing, created: false }
+      this.db
+        .prepare(
+          `INSERT INTO thread_attachments
+             (id, thread_id, attachment_type, identity_key, payload_json, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          attachment.id,
+          threadId,
+          attachment.attachmentType,
+          attachment.identityKey,
+          JSON.stringify(attachment.payload ?? null),
+          nowSeconds(),
+        )
+      const created = this.threadAttachment(
+        threadId,
+        attachment.attachmentType,
+        attachment.identityKey,
+      )
+      if (!created) throw new Error(`thread attachment was not saved: ${attachment.id}`)
+      return { attachment: created, created: true }
+    })
+  }
+
+  // Oldest first.
+  listThreadAttachments(threadId: string, limit: number, offset: number): ThreadAttachmentRecord[] {
+    return (
+      this.db
+        .prepare(
+          `SELECT * FROM thread_attachments WHERE thread_id = ?
+           ORDER BY created_at, rowid LIMIT ? OFFSET ?`,
+        )
+        .all(threadId, limit, offset) as unknown[]
+    ).map((row) => this.rowToAttachment(row))
+  }
+
+  // The threads holding an attachment with this type and key, by thread id;
+  // archived null lists archived and live threads alike.
+  listAttachmentOwners(
+    owner: { attachmentType: string; identityKey: string; archived: boolean | null },
+    limit: number,
+    offset: number,
+  ): { threadId: string; archived: boolean }[] {
+    const archived = owner.archived == null ? '' : 'AND t.archived = ?'
+    const params = owner.archived == null ? [] : [owner.archived ? 1 : 0]
+    const rows = this.db
+      .prepare(
+        `SELECT a.thread_id AS thread_id, t.archived AS archived
+         FROM thread_attachments a JOIN threads t ON t.id = a.thread_id
+         WHERE a.attachment_type = ? AND a.identity_key = ? ${archived}
+         ORDER BY a.thread_id LIMIT ? OFFSET ?`,
+      )
+      .all(owner.attachmentType, owner.identityKey, ...params, limit, offset) as Array<{
+      thread_id: string
+      archived: unknown
+    }>
+    return rows.map((row) => ({ threadId: row.thread_id, archived: Number(row.archived) === 1 }))
+  }
+
+  // A fork holds what its parent held when it forked, as in Codex: each
+  // attachment is copied with its type, key, payload and time under a new id.
+  copyThreadAttachments(fromThreadId: string, toThreadId: string): void {
+    this.transaction(() => {
+      const rows = this.db
+        .prepare('SELECT * FROM thread_attachments WHERE thread_id = ? ORDER BY created_at, rowid')
+        .all(fromThreadId) as Array<Record<string, unknown>>
+      const insert = this.db.prepare(
+        `INSERT OR IGNORE INTO thread_attachments
+           (id, thread_id, attachment_type, identity_key, payload_json, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      for (const row of rows)
+        insert.run(
+          newId(),
+          toThreadId,
+          row.attachment_type,
+          row.identity_key,
+          row.payload_json,
+          row.created_at,
+        )
+    })
+  }
+
+  // Returns the removed attachment, or null when there was none.
+  removeThreadAttachment(
+    threadId: string,
+    attachmentType: string,
+    identityKey: string,
+  ): ThreadAttachmentRecord | null {
+    const existing = this.threadAttachment(threadId, attachmentType, identityKey)
+    if (existing) this.db.prepare('DELETE FROM thread_attachments WHERE id = ?').run(existing.id)
+    return existing
+  }
+
+  private threadAttachment(
+    threadId: string,
+    attachmentType: string,
+    identityKey: string,
+  ): ThreadAttachmentRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM thread_attachments
+         WHERE thread_id = ? AND attachment_type = ? AND identity_key = ?`,
+      )
+      .get(threadId, attachmentType, identityKey)
+    return row ? this.rowToAttachment(row) : null
+  }
+
+  addImportHistory(history: ImportHistoryRecord): void {
+    this.db
+      .prepare(
+        `INSERT INTO import_histories
+           (id, provider_id, completed_at_ms, successes_json, failures_json)
+         VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(
+        history.importId,
+        history.providerId,
+        history.completedAtMs,
+        JSON.stringify(history.successes),
+        JSON.stringify(history.failures),
+      )
+  }
+
+  // Newest first.
+  listImportHistories(): ImportHistoryRecord[] {
+    return (
+      this.db
+        .prepare('SELECT * FROM import_histories ORDER BY completed_at_ms DESC, rowid DESC')
+        .all() as Array<Record<string, unknown>>
+    ).map((row) => ({
+      importId: String(row.id),
+      providerId: row.provider_id == null ? null : String(row.provider_id),
+      completedAtMs: Number(row.completed_at_ms),
+      successes: JSON.parse(String(row.successes_json)) as unknown[],
+      failures: JSON.parse(String(row.failures_json)) as unknown[],
+    }))
+  }
+
+  // The local days (YYYY-MM-DD, oldest first) on which any turn started, and
+  // the longest a turn ran.
+  turnActivity(): { days: string[]; longestTurnMs: number | null } {
+    const days = this.db
+      .prepare(
+        `SELECT DISTINCT date(started_at, 'unixepoch', 'localtime') AS day FROM turns
+         WHERE started_at IS NOT NULL ORDER BY day`,
+      )
+      .all() as Array<{ day: unknown }>
+    const longest = this.db.prepare('SELECT MAX(duration_ms) AS longest FROM turns').get() as
+      | { longest?: unknown }
+      | undefined
+    return {
+      days: days.map((row) => String(row.day)),
+      longestTurnMs: longest?.longest == null ? null : Number(longest.longest),
+    }
+  }
+
   updateThreadStatus(threadId: string, status: ThreadStatus): void {
     this.db
       .prepare('UPDATE threads SET status_json = ?, updated_at = ? WHERE id = ?')
@@ -601,10 +1180,11 @@ export class SessionStore {
   }
 
   upsertTurn(turn: TurnRecord): void {
+    const owner = currentProcessOwner()
     this.db
       .prepare(`
-        INSERT INTO turns (id, thread_id, status, started_at, completed_at, duration_ms, items_json, diff, error_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO turns (id, thread_id, status, started_at, completed_at, duration_ms, items_json, diff, error_json, root_turn_id, owner_pid, owner_started)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           status=excluded.status,
           started_at=excluded.started_at,
@@ -612,7 +1192,10 @@ export class SessionStore {
           duration_ms=excluded.duration_ms,
           items_json=excluded.items_json,
           diff=excluded.diff,
-          error_json=excluded.error_json
+          error_json=excluded.error_json,
+          root_turn_id=COALESCE(excluded.root_turn_id, turns.root_turn_id),
+          owner_pid=excluded.owner_pid,
+          owner_started=excluded.owner_started
       `)
       .run(
         turn.id,
@@ -624,6 +1207,9 @@ export class SessionStore {
         JSON.stringify(turn.items),
         turn.diff,
         turn.error == null ? null : JSON.stringify(turn.error),
+        turn.rootTurnId ?? null,
+        owner?.pid ?? null,
+        owner?.started ?? null,
       )
   }
 
@@ -632,11 +1218,49 @@ export class SessionStore {
     return row ? this.rowToTurn(row) : null
   }
 
+  // A turn's status, without decoding its items.
+  turnStatus(id: string): TurnRecord['status'] | null {
+    const row = this.db.prepare('SELECT status FROM turns WHERE id = ?').get(id) as
+      | { status?: unknown }
+      | undefined
+    return typeof row?.status === 'string' ? (row.status as TurnRecord['status']) : null
+  }
+
   listTurns(threadId: string): TurnRecord[] {
     const rows = this.db
       .prepare('SELECT * FROM turns WHERE thread_id = ? ORDER BY started_at ASC')
       .all(threadId)
     return rows.map((row: unknown) => this.rowToTurn(row))
+  }
+
+  // Status of the thread's newest turn, without decoding any turn's items.
+  lastTurnStatus(threadId: string): TurnRecord['status'] | null {
+    const row = this.db
+      .prepare(
+        'SELECT status FROM turns WHERE thread_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1',
+      )
+      .get(threadId) as { status?: unknown } | undefined
+    return typeof row?.status === 'string' ? (row.status as TurnRecord['status']) : null
+  }
+
+  lastTurn(threadId: string): TurnRecord | null {
+    const row = this.db
+      .prepare(
+        'SELECT * FROM turns WHERE thread_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1',
+      )
+      .get(threadId)
+    return row ? this.rowToTurn(row) : null
+  }
+
+  // Id and status of the thread's newest turn, also without decoding items.
+  lastTurnRef(threadId: string): { id: string; status: TurnRecord['status'] } | null {
+    const row = this.db
+      .prepare(
+        'SELECT id, status FROM turns WHERE thread_id = ? ORDER BY started_at DESC, rowid DESC LIMIT 1',
+      )
+      .get(threadId) as { id?: unknown; status?: unknown } | undefined
+    if (typeof row?.id !== 'string' || typeof row.status !== 'string') return null
+    return { id: row.id, status: row.status as TurnRecord['status'] }
   }
 
   // Used by thread/rollback to drop the N most recent turns from a thread's
@@ -654,10 +1278,389 @@ export class SessionStore {
     return ids.length
   }
 
+  // thread/revert: drops `turnId` and every later turn. Returns the number of
+  // turns removed (0 when the turn is not part of the thread).
+  deleteTurnsFrom(threadId: string, turnId: string): number {
+    const ids = (
+      this.db
+        .prepare('SELECT id FROM turns WHERE thread_id = ? ORDER BY started_at ASC, rowid ASC')
+        .all(threadId) as Array<{ id: string }>
+    ).map((row) => row.id)
+    const start = ids.indexOf(turnId)
+    if (start < 0) return 0
+    const stmt = this.db.prepare('DELETE FROM turns WHERE id = ?')
+    for (const id of ids.slice(start)) stmt.run(id)
+    return ids.length - start
+  }
+
+  // The newest transcript entry Claude wrote for a turn. Resuming its session
+  // at that entry restores the context the thread had when the turn ended.
+  setTurnCheckpoint(turnId: string, checkpoint: ClaudeCheckpoint): void {
+    this.db
+      .prepare('UPDATE turns SET claude_session_id = ?, claude_message_uuid = ? WHERE id = ?')
+      .run(checkpoint.sessionId, checkpoint.messageUuid, turnId)
+  }
+
+  turnCheckpoint(turnId: string): ClaudeCheckpoint | null {
+    const row = this.db
+      .prepare('SELECT claude_session_id, claude_message_uuid FROM turns WHERE id = ?')
+      .get(turnId) as { claude_session_id?: unknown; claude_message_uuid?: unknown } | undefined
+    return checkpointFrom(row?.claude_session_id, row?.claude_message_uuid)
+  }
+
+  // Where a forked thread branched off its parent's Claude session; a rewind
+  // past the thread's own first turn returns there. A fork taken before
+  // anything Claude remembers starts at 'new'.
+  setForkCheckpoint(threadId: string, point: ClaudeResumePoint | null): void {
+    const checkpoint = point === 'new' ? null : point
+    this.db
+      .prepare(
+        'UPDATE threads SET claude_fork_session_id = ?, claude_fork_message_uuid = ?, claude_fork_new_session = ? WHERE id = ?',
+      )
+      .run(
+        checkpoint?.sessionId ?? null,
+        checkpoint?.messageUuid ?? null,
+        point === 'new' ? 1 : 0,
+        threadId,
+      )
+  }
+
+  forkCheckpoint(threadId: string): ClaudeResumePoint | null {
+    const row = this.db
+      .prepare(
+        'SELECT claude_fork_session_id, claude_fork_message_uuid, claude_fork_new_session FROM threads WHERE id = ?',
+      )
+      .get(threadId) as
+      | {
+          claude_fork_session_id?: unknown
+          claude_fork_message_uuid?: unknown
+          claude_fork_new_session?: unknown
+        }
+      | undefined
+    if (Number(row?.claude_fork_new_session) === 1) return 'new'
+    return checkpointFrom(row?.claude_fork_session_id, row?.claude_fork_message_uuid)
+  }
+
+  // Points the thread's next Claude turn at `sessionId`, resumed only up to
+  // the `resumeAt` entry (in a forked session) when given. A null session
+  // starts a new one.
+  rewindClaudeSession(threadId: string, sessionId: string | null, resumeAt: string | null): void {
+    this.db
+      .prepare(
+        'UPDATE threads SET claude_session_id = ?, claude_resume_at = ?, updated_at = ? WHERE id = ?',
+      )
+      .run(sessionId, sessionId ? resumeAt : null, nowSeconds(), threadId)
+  }
+
+  // The pending rewind target within claude_session_id, if any.
+  claudeResumeAt(threadId: string): string | null {
+    const row = this.db
+      .prepare('SELECT claude_resume_at FROM threads WHERE id = ?')
+      .get(threadId) as { claude_resume_at?: unknown } | undefined
+    return typeof row?.claude_resume_at === 'string' ? row.claude_resume_at : null
+  }
+
+  clearClaudeResumeAt(threadId: string): void {
+    this.db.prepare('UPDATE threads SET claude_resume_at = NULL WHERE id = ?').run(threadId)
+  }
+
+  // A thread's history as clients see it: the turns it was forked with, then
+  // its own. As in Codex, a fork holds a copy of the turns it inherited, ids
+  // and all, so they outlive a rollback or delete of the thread it came from.
+  historyTurns(threadId: string): TurnRecord[] {
+    this.ensureInheritedHistory(threadId)
+    return [...this.listInheritedTurns(threadId), ...this.listTurns(threadId)]
+  }
+
+  // One turn of the thread's history: its own, or one it inherited.
+  historyTurn(threadId: string, turnId: string): TurnRecord | null {
+    const own = this.db
+      .prepare('SELECT * FROM turns WHERE id = ? AND thread_id = ?')
+      .get(turnId, threadId)
+    if (own) return this.rowToTurn(own)
+    this.ensureInheritedHistory(threadId)
+    const inherited = this.db
+      .prepare('SELECT * FROM thread_inherited_turns WHERE thread_id = ? AND id = ?')
+      .get(threadId, turnId)
+    return inherited ? this.rowToTurn(inherited) : null
+  }
+
+  private listInheritedTurns(threadId: string): TurnRecord[] {
+    const rows = this.db
+      .prepare('SELECT * FROM thread_inherited_turns WHERE thread_id = ? ORDER BY position ASC')
+      .all(threadId)
+    return rows.map((row: unknown) => this.rowToTurn(row))
+  }
+
+  // Id and status of the newest turn the thread's history holds, its own or,
+  // for a fork with none yet, the last one it inherited; without decoding
+  // items.
+  lastHistoryTurnRef(threadId: string): { id: string; status: TurnRecord['status'] } | null {
+    const own = this.lastTurnRef(threadId)
+    if (own) return own
+    this.ensureInheritedHistory(threadId)
+    const row = this.db
+      .prepare(
+        'SELECT id, status FROM thread_inherited_turns WHERE thread_id = ? ORDER BY position DESC LIMIT 1',
+      )
+      .get(threadId) as { id?: unknown; status?: unknown } | undefined
+    if (typeof row?.id !== 'string' || typeof row.status !== 'string') return null
+    return { id: row.id, status: row.status as TurnRecord['status'] }
+  }
+
+  inheritedTurnCount(threadId: string): number {
+    const row = this.db
+      .prepare('SELECT COUNT(*) AS count FROM thread_inherited_turns WHERE thread_id = ?')
+      .get(threadId) as { count?: unknown } | undefined
+    return Number(row?.count ?? 0)
+  }
+
+  // Gives the fork `threadId` a copy of the first `count` turns of its
+  // parent's history, each with its Claude checkpoint. A turn still running
+  // is copied as interrupted: the fork never sees the rest of it.
+  copyInheritedHistory(threadId: string, parentId: string, count: number): void {
+    this.ensureInheritedHistory(parentId)
+    this.transaction(() => this.writeInheritedHistory(threadId, parentId, count))
+  }
+
+  // Drops the inherited turns from position `keep` on. Returns how many went.
+  truncateInheritedTurns(threadId: string, keep: number): number {
+    const result = this.db
+      .prepare('DELETE FROM thread_inherited_turns WHERE thread_id = ? AND position >= ?')
+      .run(threadId, Math.max(0, keep)) as { changes?: number | bigint }
+    return Number(result.changes ?? 0)
+  }
+
+  // Where Claude's context stands after the first `count` inherited turns:
+  // the newest of their checkpoints, or with none of them, the base the
+  // copy recorded. Null when those turns predate checkpoints.
+  contextAfterInherited(threadId: string, count: number): ClaudeResumePoint | null {
+    if (count > 0) {
+      const row = this.db
+        .prepare(
+          `SELECT claude_session_id, claude_message_uuid FROM thread_inherited_turns
+           WHERE thread_id = ? AND position < ? AND claude_session_id IS NOT NULL
+             AND claude_message_uuid IS NOT NULL
+           ORDER BY position DESC LIMIT 1`,
+        )
+        .get(threadId, count) as
+        | { claude_session_id?: unknown; claude_message_uuid?: unknown }
+        | undefined
+      return checkpointFrom(row?.claude_session_id, row?.claude_message_uuid)
+    }
+    const row = this.db
+      .prepare('SELECT inherited_base_json FROM threads WHERE id = ?')
+      .get(threadId) as { inherited_base_json?: unknown } | undefined
+    return parseResumePoint(row?.inherited_base_json)
+  }
+
+  // A fork made before forks kept their history gets the turns it was forked
+  // with the first time anything reads it, when its fork checkpoint shows
+  // exactly where it branched off. Otherwise it keeps only its own turns.
+  private ensureInheritedHistory(threadId: string, depth = 0): void {
+    const row = this.db
+      .prepare(
+        'SELECT forked_from_id, ephemeral, thread_source, inherited_history FROM threads WHERE id = ?',
+      )
+      .get(threadId) as
+      | {
+          forked_from_id?: unknown
+          ephemeral?: unknown
+          thread_source?: unknown
+          inherited_history?: unknown
+        }
+      | undefined
+    if (
+      !row ||
+      row.inherited_history != null ||
+      typeof row.forked_from_id !== 'string' ||
+      Number(row.ephemeral) === 1 ||
+      row.thread_source === 'subagent' ||
+      depth > 64
+    )
+      return
+    const parentId = row.forked_from_id
+    this.ensureInheritedHistory(parentId, depth + 1)
+    this.transaction(() => {
+      const state = this.db
+        .prepare('SELECT inherited_history FROM threads WHERE id = ?')
+        .get(threadId) as { inherited_history?: unknown } | undefined
+      if (state?.inherited_history != null) return
+      const count = this.legacyForkLength(threadId, parentId)
+      if (count === null) {
+        this.db.prepare('UPDATE threads SET inherited_history = 2 WHERE id = ?').run(threadId)
+      } else {
+        this.writeInheritedHistory(threadId, parentId, count)
+      }
+    })
+  }
+
+  // How many turns of its parent's history a fork made before forks kept
+  // their history was forked with, read off its fork checkpoint. Null when
+  // that is not certain: the checkpoint is gone from the parent (rolled back,
+  // deleted), or turns without a checkpoint sit where the fork could have
+  // stopped instead.
+  private legacyForkLength(threadId: string, parentId: string): number | null {
+    if (!this.getThread(parentId)) return null
+    const point = this.forkCheckpoint(threadId)
+    if (point === 'new') return 0
+    if (!point) return null
+    const entries = this.historyCheckpoints(parentId)
+    const index = entries.findLastIndex(
+      (entry) =>
+        entry.checkpoint?.sessionId === point.sessionId &&
+        entry.checkpoint.messageUuid === point.messageUuid,
+    )
+    if (index < 0) return null
+    // A fork that stopped right after the match, at a turn without a
+    // checkpoint, got the match's checkpoint too.
+    const next = entries[index + 1]
+    if (next && !next.checkpoint) return null
+    // Turns without a checkpoint at the start of the parent's own turns let
+    // a fork stop there and resume the parent's whole session instead.
+    const ownStart = this.inheritedTurnCount(parentId)
+    const firstOwn = entries[ownStart]
+    if (firstOwn && ownStart <= index && !firstOwn.checkpoint) return null
+    return index + 1
+  }
+
+  // The Claude checkpoint and start (unix seconds) of each turn of a thread's
+  // history, its inherited turns first.
+  turnCheckpoints(
+    threadId: string,
+  ): Array<{ checkpoint: ClaudeCheckpoint | null; startedAt: number | null }> {
+    this.ensureInheritedHistory(threadId)
+    return this.historyCheckpoints(threadId)
+  }
+
+  private historyCheckpoints(
+    threadId: string,
+  ): Array<{ checkpoint: ClaudeCheckpoint | null; startedAt: number | null }> {
+    return this.historyRows(threadId, 'claude_session_id, claude_message_uuid, started_at').map(
+      (row) => ({
+        checkpoint: checkpointFrom(row.claude_session_id, row.claude_message_uuid),
+        startedAt: row.started_at == null ? null : Number(row.started_at),
+      }),
+    )
+  }
+
+  // The given columns of the first `limit` turns of a thread's history (all
+  // of them when null), its inherited turns first, as stored.
+  private historyRows(threadId: string, columns: string, limit: number | null = null): any[] {
+    // SQLite reads a negative LIMIT as none.
+    const cap = limit === null ? -1 : Math.max(0, limit)
+    const inherited = this.db
+      .prepare(
+        `SELECT ${columns} FROM thread_inherited_turns WHERE thread_id = ? ORDER BY position ASC LIMIT ?`,
+      )
+      .all(threadId, cap) as any[]
+    if (cap >= 0 && inherited.length >= cap) return inherited
+    const own = this.db
+      .prepare(
+        `SELECT ${columns} FROM turns WHERE thread_id = ? ORDER BY started_at ASC, rowid ASC LIMIT ?`,
+      )
+      .all(threadId, cap < 0 ? -1 : cap - inherited.length) as any[]
+    return [...inherited, ...own]
+  }
+
+  // Where Claude's context stands before the first turn of a thread's
+  // history: a fork's base, else its fork point, else a new session.
+  private historyBase(threadId: string): ClaudeResumePoint | null {
+    const row = this.db
+      .prepare(
+        'SELECT forked_from_id, inherited_history, inherited_base_json FROM threads WHERE id = ?',
+      )
+      .get(threadId) as
+      | { forked_from_id?: unknown; inherited_history?: unknown; inherited_base_json?: unknown }
+      | undefined
+    if (!row) return null
+    if (Number(row.inherited_history) === 1) return parseResumePoint(row.inherited_base_json)
+    if (row.forked_from_id == null) return 'new'
+    return this.forkCheckpoint(threadId)
+  }
+
+  // Inside a transaction: replaces the fork's inherited turns with the first
+  // `count` turns of its parent's history.
+  private writeInheritedHistory(threadId: string, parentId: string, count: number): void {
+    this.db.prepare('DELETE FROM thread_inherited_turns WHERE thread_id = ?').run(threadId)
+    const columns =
+      'id, status, started_at, completed_at, duration_ms, items_json, diff, error_json, root_turn_id, claude_session_id, claude_message_uuid'
+    const rows = this.historyRows(parentId, columns, count)
+    const insert = this.db.prepare(
+      `INSERT INTO thread_inherited_turns (thread_id, position, ${columns})
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    for (const [position, row] of rows.entries()) {
+      insert.run(
+        threadId,
+        position,
+        row.id,
+        row.status === 'inProgress' ? 'interrupted' : row.status,
+        row.started_at ?? null,
+        row.completed_at ?? null,
+        row.duration_ms ?? null,
+        row.items_json,
+        row.diff ?? '',
+        row.error_json ?? null,
+        row.root_turn_id ?? null,
+        row.claude_session_id ?? null,
+        row.claude_message_uuid ?? null,
+      )
+    }
+    this.db
+      .prepare('UPDATE threads SET inherited_history = 1, inherited_base_json = ? WHERE id = ?')
+      .run(serializeResumePoint(this.historyBase(parentId)), threadId)
+  }
+
+  // thread/delete: the thread, the subagent threads it spawned (recursively)
+  // and everything stored for them. Returns the deleted thread ids.
+  deleteThread(threadId: string): string[] {
+    const ids = (
+      this.db
+        .prepare(
+          `WITH RECURSIVE doomed(id) AS (
+             SELECT id FROM threads WHERE id = ?
+             UNION
+             SELECT child.id FROM threads child JOIN doomed parent ON child.forked_from_id = parent.id
+             WHERE child.thread_source = 'subagent'
+           )
+           SELECT id FROM doomed`,
+        )
+        .all(threadId) as Array<{ id: string }>
+    ).map((row) => row.id)
+    for (const id of ids) {
+      this.db.prepare('DELETE FROM turns WHERE thread_id = ?').run(id)
+      this.db.prepare('DELETE FROM thread_inherited_turns WHERE thread_id = ?').run(id)
+      this.db.prepare('DELETE FROM thread_goals WHERE thread_id = ?').run(id)
+      this.db.prepare('DELETE FROM thread_queues WHERE thread_id = ?').run(id)
+      this.db.prepare('DELETE FROM thread_dynamic_tools WHERE thread_id = ?').run(id)
+      this.db.prepare('DELETE FROM thread_injected_items WHERE thread_id = ?').run(id)
+      this.db.prepare('DELETE FROM thread_attachments WHERE thread_id = ?').run(id)
+      // Only the thread's own link: threads it led keep theirs, so they
+      // stay below the depth limit after their leader is gone.
+      this.db.prepare('DELETE FROM leader_threads WHERE thread_id = ?').run(id)
+      this.db.prepare('DELETE FROM threads WHERE id = ?').run(id)
+    }
+    return ids
+  }
+
   appendItem(turnId: string, item: ThreadItem): TurnRecord | null {
     const turn = this.getTurn(turnId)
     if (!turn) return null
     turn.items.push(jsonClone(item))
+    this.upsertTurn(turn)
+    return turn
+  }
+
+  // Puts the item right after afterItemId: first when that is null, last when
+  // the turn has no such item.
+  insertItemAfter(turnId: string, afterItemId: string | null, item: ThreadItem): TurnRecord | null {
+    const turn = this.getTurn(turnId)
+    if (!turn) return null
+    const index =
+      afterItemId === null ? 0 : turn.items.findIndex((entry) => entry.id === afterItemId) + 1
+    if (afterItemId !== null && index === 0) turn.items.push(jsonClone(item))
+    else turn.items.splice(index, 0, jsonClone(item))
     this.upsertTurn(turn)
     return turn
   }
@@ -695,28 +1698,47 @@ export class SessionStore {
     turnId: string,
     status: TurnStatus,
     error: unknown | null = null,
+    durationMs: number | null = null,
   ): TurnRecord | null {
     const turn = this.getTurn(turnId)
     if (!turn) return null
-    const completedAt = nowSeconds()
-    turn.status = status
-    turn.completedAt = completedAt
-    turn.durationMs =
-      turn.startedAt == null ? null : Math.max(0, (completedAt - turn.startedAt) * 1000)
-    turn.error = error
-    this.upsertTurn(turn)
-    return turn
+    const completed = settledTurn(turn, status, error)
+    // A duration the runtime measured, in place of the one the turn's times give.
+    if (durationMs != null) completed.durationMs = durationMs
+    this.upsertTurn(completed)
+    return completed
   }
 
+  // Fails the in-progress turns of servers that are gone. A turn another
+  // server on this state dir still runs is left alone, as are the item
+  // markers in its turns; a turn written before turns recorded their server
+  // is failed as before.
   recoverStaleInProgressTurns(message = 'server restarted before completing turn'): number {
-    const rows = this.db
-      .prepare('SELECT id, thread_id, started_at, items_json FROM turns WHERE status = ?')
-      .all('inProgress') as Array<{
-      id: string
-      thread_id: string
-      started_at: number | null
-      items_json: string
-    }>
+    const running = new Map<string, boolean>()
+    const ownerRunning = (row: { owner_pid: number | null; owner_started: string | null }) => {
+      if (row.owner_pid == null || row.owner_started == null) return false
+      const key = `${row.owner_pid} ${row.owner_started}`
+      let alive = running.get(key)
+      if (alive === undefined) {
+        alive = otherProcessRunning({ pid: Number(row.owner_pid), started: row.owner_started })
+        running.set(key, alive)
+      }
+      return alive
+    }
+    const rows = (
+      this.db
+        .prepare(
+          'SELECT id, thread_id, started_at, items_json, owner_pid, owner_started FROM turns WHERE status = ?',
+        )
+        .all('inProgress') as Array<{
+        id: string
+        thread_id: string
+        started_at: number | null
+        items_json: string
+        owner_pid: number | null
+        owner_started: string | null
+      }>
+    ).filter((row) => !ownerRunning(row))
     const completedAt = nowSeconds()
     const errorJson = JSON.stringify({ message })
     const updateTurn = this.db.prepare(`
@@ -724,11 +1746,19 @@ export class SessionStore {
       SET status = ?, completed_at = ?, duration_ms = ?, error_json = ?, items_json = ?
       WHERE id = ?
     `)
-    const updateThread = this.db.prepare(
-      'UPDATE threads SET status_json = ?, updated_at = ? WHERE id = ?',
+    const reconcileThread = this.db.prepare(
+      `UPDATE threads SET status_json = ?, updated_at = ?
+       WHERE id = ?
+         AND NOT EXISTS (SELECT 1 FROM turns WHERE thread_id = threads.id AND status = ?)`,
     )
     const seenThreads = new Set<string>()
     let recoveredCount = 0
+    // Agents whose own turn the restart cut off, or that never got one. Any
+    // marker that still shows one of them working, here or in an earlier
+    // parent turn, is stale.
+    const cutOff = new Set(rows.map((row) => String(row.thread_id)))
+    const hasTurn = this.db.prepare('SELECT 1 FROM turns WHERE thread_id = ? LIMIT 1')
+    const isDead = (threadId: string) => cutOff.has(threadId) || hasTurn.get(threadId) === undefined
     for (const row of rows) {
       const startedAt = row.started_at == null ? null : Number(row.started_at)
       const durationMs = startedAt == null ? null : Math.max(0, (completedAt - startedAt) * 1000)
@@ -737,46 +1767,38 @@ export class SessionStore {
         completedAt,
         durationMs,
         errorJson,
-        this.terminalizeStaleItems(row.items_json, message),
+        this.terminalizeStaleItems(row.items_json, message, isDead),
         row.id,
       )
       seenThreads.add(String(row.thread_id))
       recoveredCount += 1
     }
     for (const threadId of seenThreads) {
-      updateThread.run(JSON.stringify({ type: 'idle' }), completedAt, threadId)
+      reconcileThread.run(JSON.stringify({ type: 'idle' }), completedAt, threadId, 'inProgress')
     }
     const terminalRows = this.db
-      .prepare('SELECT id, thread_id, status, items_json FROM turns WHERE status <> ?')
+      .prepare(
+        'SELECT id, thread_id, status, items_json, owner_pid, owner_started FROM turns WHERE status <> ?',
+      )
       .all('inProgress') as Array<{
       id: string
       thread_id: string
       status: TurnStatus
       items_json: string
+      owner_pid: number | null
+      owner_started: string | null
     }>
     const updateItems = this.db.prepare('UPDATE turns SET items_json = ? WHERE id = ?')
     const repairThreadIds = new Set<string>()
     for (const row of terminalRows) {
-      // A successful legacy Codex cc turn may contain only a
-      // `subAgentActivity: started` marker. Remove that optional marker during
-      // recovery so the canonical spawnAgent/wait terminal state is used and
-      // a cold-opened child cannot be revived as working.
-      const itemsJson = this.terminalizeStaleItems(
-        row.items_json,
-        message,
-        row.status !== 'completed',
-        row.status === 'completed',
-      )
-      if (itemsJson === row.items_json) continue
+      // A background agent outlives the parent turn that spawned it, so its
+      // markers can sit in a turn that ended long before the restart.
+      const itemsJson = this.terminalizeStaleItems(row.items_json, message, isDead)
+      if (itemsJson === row.items_json || ownerRunning(row)) continue
       updateItems.run(itemsJson, row.id)
       repairThreadIds.add(String(row.thread_id))
       recoveredCount += 1
     }
-    const reconcileThread = this.db.prepare(
-      `UPDATE threads SET status_json = ?, updated_at = ?
-       WHERE id = ?
-         AND NOT EXISTS (SELECT 1 FROM turns WHERE thread_id = threads.id AND status = ?)`,
-    )
     for (const threadId of repairThreadIds) {
       reconcileThread.run(JSON.stringify({ type: 'idle' }), completedAt, threadId, 'inProgress')
     }
@@ -799,14 +1821,14 @@ export class SessionStore {
     return recoveredCount
   }
 
-  // A recovered turn is also replayed from its persisted item list. Clear any
-  // item-level liveness markers so the App's spinner projection cannot keep a
-  // child agent in `working` after the turn/thread has been terminalized.
+  // A recovered turn is also replayed from its persisted item list. Clear the
+  // item-level liveness markers of agents the restart killed so the App's
+  // spinner projection cannot keep them `working`. Markers of agents that
+  // finished stay as they were streamed, so a reload matches the live view.
   private terminalizeStaleItems(
     itemsJson: string,
     message: string,
-    terminalizeActivity = true,
-    stripCompletedActivity = false,
+    isDead: (threadId: string) => boolean,
   ): string {
     let parsed: unknown
     try {
@@ -816,59 +1838,48 @@ export class SessionStore {
     }
     if (!Array.isArray(parsed)) return '[]'
 
-    const items = parsed
-      .map((raw) => {
-        if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) return raw
-        const item = raw as Record<string, unknown>
-        if (stripCompletedActivity && item.type === 'subAgentActivity') return null
-        if (
-          terminalizeActivity &&
-          item.type === 'subAgentActivity' &&
-          (item.kind === 'started' || item.kind === 'interacted')
-        ) {
-          return { ...item, kind: 'interrupted' }
+    const items = parsed.map((raw) => {
+      if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) return raw
+      const item = raw as Record<string, unknown>
+      if (
+        item.type === 'subAgentActivity' &&
+        (item.kind === 'started' || item.kind === 'interacted') &&
+        isDead(String(item.agentThreadId))
+      ) {
+        return { ...item, kind: 'interrupted' }
+      }
+      if (item.type === 'collabAgentToolCall') {
+        const agentsStates = item.agentsStates
+        const nextStates =
+          agentsStates && typeof agentsStates === 'object' && !Array.isArray(agentsStates)
+            ? Object.fromEntries(
+                Object.entries(agentsStates as Record<string, unknown>).map(
+                  ([threadId, rawState]) => {
+                    if (rawState == null || typeof rawState !== 'object' || Array.isArray(rawState))
+                      return [threadId, rawState]
+                    const state = rawState as Record<string, unknown>
+                    if (
+                      (state.status !== 'pendingInit' && state.status !== 'running') ||
+                      !isDead(threadId)
+                    )
+                      return [threadId, state]
+                    return [
+                      threadId,
+                      { ...state, status: 'errored', message: state.message ?? message },
+                    ]
+                  },
+                ),
+              )
+            : agentsStates
+        return {
+          ...item,
+          ...(item.status === 'inProgress' ? { status: 'failed' } : {}),
+          agentsStates: nextStates,
         }
-        // Older adapter builds persisted the newer `completed` activity kind,
-        // which Codex cc 26.x cannot deserialize. `interrupted` is the legacy
-        // terminal marker understood by the App reducer and prevents a cold
-        // open from reviving the child as working.
-        if (item.type === 'subAgentActivity' && item.kind === 'completed') {
-          return { ...item, kind: 'interrupted' }
-        }
-        if (item.type === 'collabAgentToolCall') {
-          const agentsStates = item.agentsStates
-          const nextStates =
-            agentsStates && typeof agentsStates === 'object' && !Array.isArray(agentsStates)
-              ? Object.fromEntries(
-                  Object.entries(agentsStates as Record<string, unknown>).map(
-                    ([threadId, rawState]) => {
-                      if (
-                        rawState == null ||
-                        typeof rawState !== 'object' ||
-                        Array.isArray(rawState)
-                      )
-                        return [threadId, rawState]
-                      const state = rawState as Record<string, unknown>
-                      if (state.status !== 'pendingInit' && state.status !== 'running')
-                        return [threadId, state]
-                      return [
-                        threadId,
-                        { ...state, status: 'errored', message: state.message ?? message },
-                      ]
-                    },
-                  ),
-                )
-              : agentsStates
-          return {
-            ...item,
-            ...(item.status === 'inProgress' ? { status: 'failed' } : {}),
-            agentsStates: nextStates,
-          }
-        }
-        if (item.status === 'inProgress') return { ...item, status: 'failed' }
-        return item
-      })
-      .filter((item) => item != null)
+      }
+      if (item.status === 'inProgress') return { ...item, status: 'failed' }
+      return item
+    })
     return JSON.stringify(items)
   }
 
@@ -878,6 +1889,139 @@ export class SessionStore {
     turn.diff = diff
     this.upsertTurn(turn)
     return turn
+  }
+
+  getGoal(threadId: string): ThreadGoal | null {
+    const row = this.db
+      .prepare('SELECT goal_json FROM thread_goals WHERE thread_id = ?')
+      .get(threadId) as { goal_json: string } | undefined
+    return row ? (JSON.parse(row.goal_json) as ThreadGoal) : null
+  }
+
+  putGoal(goal: ThreadGoal): void {
+    this.db
+      .prepare(
+        `INSERT INTO thread_goals (thread_id, goal_json) VALUES (?, ?)
+         ON CONFLICT(thread_id) DO UPDATE SET goal_json = excluded.goal_json`,
+      )
+      .run(goal.threadId, JSON.stringify(goal))
+  }
+
+  deleteGoal(threadId: string): boolean {
+    const result = this.db.prepare('DELETE FROM thread_goals WHERE thread_id = ?').run(threadId)
+    return Number(result.changes) > 0
+  }
+
+  // Threads another thread started with the leader tools. The link decides
+  // who may prompt and wait on a thread and keeps a led thread from leading
+  // in turn; seen_turn_id is the last finished turn its leader has read.
+  addLeaderThread(threadId: string, leaderThreadId: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO leader_threads (thread_id, leader_thread_id, seen_turn_id, created_at)
+         VALUES (?, ?, NULL, ?)
+         ON CONFLICT(thread_id) DO UPDATE SET leader_thread_id = excluded.leader_thread_id`,
+      )
+      .run(threadId, leaderThreadId, nowSeconds())
+  }
+
+  leaderOf(threadId: string): string | null {
+    const row = this.db
+      .prepare('SELECT leader_thread_id FROM leader_threads WHERE thread_id = ?')
+      .get(threadId) as { leader_thread_id: string } | undefined
+    return row?.leader_thread_id ?? null
+  }
+
+  listLeaderThreads(
+    leaderThreadId: string,
+  ): Array<{ threadId: string; seenTurnId: string | null }> {
+    const rows = this.db
+      .prepare(
+        `SELECT thread_id, seen_turn_id FROM leader_threads
+         WHERE leader_thread_id = ? ORDER BY created_at, rowid`,
+      )
+      .all(leaderThreadId) as Array<{ thread_id: string; seen_turn_id: string | null }>
+    return rows.map((row) => ({ threadId: row.thread_id, seenTurnId: row.seen_turn_id }))
+  }
+
+  markLeaderSeen(threadId: string, turnId: string): void {
+    this.db
+      .prepare('UPDATE leader_threads SET seen_turn_id = ? WHERE thread_id = ?')
+      .run(turnId, threadId)
+  }
+
+  listQueue(threadId: string): QueuedSubmission[] {
+    const row = this.db
+      .prepare('SELECT items_json FROM thread_queues WHERE thread_id = ?')
+      .get(threadId) as { items_json: string } | undefined
+    return row ? (JSON.parse(row.items_json) as QueuedSubmission[]) : []
+  }
+
+  saveQueue(threadId: string, items: QueuedSubmission[]): void {
+    if (items.length === 0) {
+      this.db.prepare('DELETE FROM thread_queues WHERE thread_id = ?').run(threadId)
+      return
+    }
+    this.db
+      .prepare(
+        `INSERT INTO thread_queues (thread_id, items_json) VALUES (?, ?)
+         ON CONFLICT(thread_id) DO UPDATE SET items_json = excluded.items_json`,
+      )
+      .run(threadId, JSON.stringify(items))
+  }
+
+  // The dynamic tools the client registered on thread/start. Codex keeps them
+  // in the session meta, so a resumed or restarted thread still has them.
+  getDynamicTools(threadId: string): DynamicToolSpec[] {
+    const row = this.db
+      .prepare('SELECT tools_json FROM thread_dynamic_tools WHERE thread_id = ?')
+      .get(threadId) as { tools_json: string } | undefined
+    return row ? (JSON.parse(row.tools_json) as DynamicToolSpec[]) : []
+  }
+
+  putDynamicTools(threadId: string, tools: DynamicToolSpec[]): void {
+    if (tools.length === 0) {
+      this.db.prepare('DELETE FROM thread_dynamic_tools WHERE thread_id = ?').run(threadId)
+      return
+    }
+    this.db
+      .prepare(
+        `INSERT INTO thread_dynamic_tools (thread_id, tools_json) VALUES (?, ?)
+         ON CONFLICT(thread_id) DO UPDATE SET tools_json = excluded.tools_json`,
+      )
+      .run(threadId, JSON.stringify(tools))
+  }
+
+  // The items the client injected with thread/inject_items that no turn has
+  // read yet, in the order they came. Codex adds them to the thread's model
+  // history at once; Claude reads them with the next message.
+  addInjectedItems(threadId: string, items: readonly unknown[]): void {
+    if (items.length === 0) return
+    this.transaction(() => {
+      const row = this.db
+        .prepare('SELECT items_json FROM thread_injected_items WHERE thread_id = ?')
+        .get(threadId) as { items_json: string } | undefined
+      const pending = row ? (JSON.parse(row.items_json) as unknown[]) : []
+      this.db
+        .prepare(
+          `INSERT INTO thread_injected_items (thread_id, items_json) VALUES (?, ?)
+           ON CONFLICT(thread_id) DO UPDATE SET items_json = excluded.items_json`,
+        )
+        .run(threadId, JSON.stringify([...pending, ...items]))
+    })
+  }
+
+  // Hands the pending items over once: the turn that takes them is the one
+  // that reads them.
+  takeInjectedItems(threadId: string): unknown[] {
+    return this.transaction(() => {
+      const row = this.db
+        .prepare('SELECT items_json FROM thread_injected_items WHERE thread_id = ?')
+        .get(threadId) as { items_json: string } | undefined
+      if (!row) return []
+      this.db.prepare('DELETE FROM thread_injected_items WHERE thread_id = ?').run(threadId)
+      return JSON.parse(row.items_json) as unknown[]
+    })
   }
 
   close(): void {
@@ -899,6 +2043,8 @@ export class SessionStore {
       archived: Number(row.archived) === 1,
       cwd: String(row.cwd),
       model: String(row.model),
+      modelProfileFingerprint:
+        row.model_profile_fingerprint == null ? null : String(row.model_profile_fingerprint),
       reasoningEffort: row.reasoning_effort == null ? null : String(row.reasoning_effort),
       modelProvider: String(row.model_provider),
       claudeSessionId: row.claude_session_id == null ? null : String(row.claude_session_id),
@@ -910,6 +2056,14 @@ export class SessionStore {
       sandboxMode: row.sandbox_mode == null ? null : String(row.sandbox_mode),
       permissionProfileId:
         row.permission_profile_id == null ? null : String(row.permission_profile_id),
+      collaborationMode:
+        row.collaboration_mode === 'plan' || row.collaboration_mode === 'default'
+          ? row.collaboration_mode
+          : null,
+      approvalsReviewer:
+        row.approvals_reviewer === 'user' || row.approvals_reviewer === 'auto_review'
+          ? row.approvals_reviewer
+          : null,
       ephemeral: Number(row.ephemeral ?? 0) === 1,
       threadSource: row.thread_source == null ? null : String(row.thread_source),
       agentRole: row.agent_role == null ? null : String(row.agent_role),
@@ -920,6 +2074,33 @@ export class SessionStore {
       personality: row.personality == null ? null : String(row.personality),
       runtimeBackend: row.runtime_backend === 'codex' ? 'codex' : 'claude',
       codexSessionId: row.codex_session_id == null ? null : String(row.codex_session_id),
+      memoryMode:
+        row.memory_mode === 'enabled' || row.memory_mode === 'disabled' ? row.memory_mode : null,
+      projectId: row.project_id == null ? null : String(row.project_id),
+      gitInfo: parseGitInfo(row.git_info_json),
+    }
+  }
+
+  private rowToProject(row: any): ProjectRecord {
+    return {
+      id: String(row.id),
+      name: String(row.name),
+      roots: JSON.parse(String(row.roots_json)),
+      metadata: JSON.parse(String(row.metadata_json)),
+      position: Number(row.position),
+      createdAt: Number(row.created_at),
+      updatedAt: Number(row.updated_at),
+      recencyAt: row.recency_at == null ? null : Number(row.recency_at),
+    }
+  }
+
+  private rowToAttachment(row: any): ThreadAttachmentRecord {
+    return {
+      id: String(row.id),
+      attachmentType: String(row.attachment_type),
+      identityKey: String(row.identity_key),
+      payload: JSON.parse(String(row.payload_json)),
+      createdAt: Number(row.created_at),
     }
   }
 
@@ -955,6 +2136,7 @@ export class SessionStore {
       items: JSON.parse(String(row.items_json)),
       diff: String(row.diff ?? ''),
       error: row.error_json == null ? null : JSON.parse(String(row.error_json)),
+      rootTurnId: row.root_turn_id == null ? null : String(row.root_turn_id),
     }
   }
 }

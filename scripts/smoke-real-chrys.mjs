@@ -36,15 +36,15 @@ const child = sshTarget
       { cwd: process.cwd(), env: process.env, stdio: ['pipe', 'pipe', 'pipe'] },
     )
   : spawn(process.execPath, [adapter, 'app-server', '--listen', 'stdio://'], {
-  cwd: process.cwd(),
-  env: {
-    ...process.env,
-    CODEX_HOME: home,
-    CHRYS_CODEX_EXECUTABLE: chrys,
-    CHRYS_CODEX_RUNTIME_TYPE: 'chrys-acp',
-    NODE_NO_WARNINGS: '1',
-  },
-  stdio: ['pipe', 'pipe', 'pipe'],
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        CODEX_HOME: home,
+        CHRYS_CODEX_EXECUTABLE: chrys,
+        CHRYS_CODEX_RUNTIME_TYPE: 'chrys-acp',
+        NODE_NO_WARNINGS: '1',
+      },
+      stdio: ['pipe', 'pipe', 'pipe'],
     })
 const lines = createInterface({ input: child.stdout })
 const queue = []

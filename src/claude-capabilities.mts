@@ -1,7 +1,16 @@
 import { createHash } from 'node:crypto'
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
+import {
+  claudeCommandManifest,
+  firstSentence,
+  listClaudeCommands,
+  listFolderCommands,
+} from './claude-commands.mjs'
+import { claudeHookFiles, claudeHookScope } from './claude-hooks.mjs'
+import { bridgedClaudeConfigDir, claudeSkillFolders } from './project-instructions.mjs'
+import { isPathInside } from './util.mjs'
 
 interface SkillMetadata {
   readonly name: string
@@ -43,22 +52,151 @@ interface HooksListEntry {
   readonly errors: ReadonlyArray<{ readonly path: string; readonly message: string }>
 }
 
+function userSkillDir(): string {
+  return join(bridgedClaudeConfigDir() ?? join(homedir(), '.claude'), 'skills')
+}
+
+function repoSkillDirs(cwd: string): string[] {
+  return claudeSkillFolders(cwd).map((dir) => join(dir, '.claude', 'skills'))
+}
+
+// The folders skills/list reads skills from for `cwd`.
+export function claudeSkillDirs(cwd: string): string[] {
+  return [userSkillDir(), ...repoSkillDirs(cwd)]
+}
+
 export function listClaudeSkills(params: Record<string, unknown>): SkillsListEntry[] {
   const roots = cwdsFromParams(params)
-  const userSkills = readSkillDir(join(homedir(), '.claude', 'skills'), 'user')
+  const userSkills = readSkillDir(userSkillDir(), 'user')
+  const builtins = listClaudeCommands().map(
+    (command): SkillMetadata => ({
+      name: command.name,
+      description: command.description,
+      shortDescription: firstSentence(command.description),
+      path: claudeCommandManifest(command.name),
+      scope: 'system',
+      enabled: true,
+    }),
+  )
   return roots.map((cwd) => {
-    const repo = readSkillDir(join(cwd, '.claude', 'skills'), 'repo')
+    const repo = repoSkillDirs(cwd).map((dir) => readSkillDir(dir, 'repo'))
+    const listed = [...userSkills.skills, ...repo.flatMap((entry) => entry.skills), ...builtins]
+    // The folder's other Claude Code commands. Claude Code reports the
+    // skills read from disk above among them; those stay as they are.
+    // App rule: skills-popup
+    const taken = new Set(listed.map((skill) => skill.name))
+    const commands = listFolderCommands(cwd)
+      .filter((command) => !taken.has(command.name))
+      .map(
+        (command): SkillMetadata => ({
+          name: command.name,
+          description: command.description,
+          shortDescription: firstSentence(command.description),
+          path: claudeCommandManifest(command.name, cwd),
+          scope: 'user',
+          enabled: true,
+        }),
+      )
     return {
       cwd,
-      skills: [...userSkills.skills, ...repo.skills],
-      errors: [...userSkills.errors, ...repo.errors],
+      skills: [...listed, ...commands],
+      errors: [...userSkills.errors, ...repo.flatMap((entry) => entry.errors)],
     }
   })
 }
 
+// App plugins whose skills Claude can carry out with its own tools: they only
+// read and write files and shape the reply. The App's other plugins drive
+// Codex-only tools, or MCP servers and hooks the App runs for Codex.
+const CLAUDE_RUNNABLE_APP_PLUGINS = new Set(['visualize'])
+
+const MARKETPLACE_MANIFEST = join('.agents', 'plugins', 'marketplace.json')
+
+export interface AppPlugin {
+  readonly name: string
+  readonly root: string
+}
+
+export interface AppSkill {
+  readonly name: string
+  readonly description: string
+  // The skill's SKILL.md; the rest of the skill sits beside it.
+  readonly path: string
+  readonly plugin: string
+}
+
+// The folder of an App plugin Claude can run, found the way plugin/install
+// names it: a local plugin in a marketplace whose manifest lives at
+// <root>/.agents/plugins/marketplace.json, with paths relative to <root>.
+export function claudeRunnableAppPlugin(
+  marketplacePath: unknown,
+  pluginName: unknown,
+): AppPlugin | null {
+  if (typeof pluginName !== 'string' || !CLAUDE_RUNNABLE_APP_PLUGINS.has(pluginName)) return null
+  const plugin = appMarketplacePlugin(marketplacePath, pluginName)
+  return plugin ? { name: plugin.name, root: plugin.root } : null
+}
+
+// Any local plugin of a marketplace plugin/install names, with the
+// marketplace's own name, which makes up the plugin's id in the Codex config
+// (<plugin>@<marketplace>).
+export function appMarketplacePlugin(
+  marketplacePath: unknown,
+  pluginName: unknown,
+): (AppPlugin & { readonly marketplace: string | null }) | null {
+  if (typeof pluginName !== 'string' || !pluginName) return null
+  if (typeof marketplacePath !== 'string' || !isAbsolute(marketplacePath)) return null
+  try {
+    const marketplace = asRecord(JSON.parse(readFileSync(marketplacePath, 'utf8')))
+    const plugins = Array.isArray(marketplace.plugins) ? marketplace.plugins.map(asRecord) : []
+    const source = plugins.find((plugin) => plugin.name === pluginName)?.source
+    const path =
+      typeof source === 'string'
+        ? source
+        : asRecord(source).source === 'local'
+          ? asRecord(source).path
+          : undefined
+    if (typeof path !== 'string') return null
+    const base = marketplacePath.endsWith(MARKETPLACE_MANIFEST)
+      ? marketplacePath.slice(0, -MARKETPLACE_MANIFEST.length)
+      : dirname(marketplacePath)
+    const root = resolve(base, path)
+    if (!isPathInside(base, root)) return null
+    const name = typeof marketplace.name === 'string' && marketplace.name ? marketplace.name : null
+    return { name: pluginName, root, marketplace: name }
+  } catch {
+    return null
+  }
+}
+
+// The skills an installed App plugin ships, read from its current files so a
+// plugin the App removed or updated is reflected on the next turn.
+export function appPluginSkills(plugins: readonly AppPlugin[]): AppSkill[] {
+  const skills: AppSkill[] = []
+  for (const plugin of plugins) {
+    if (!CLAUDE_RUNNABLE_APP_PLUGINS.has(plugin.name)) continue
+    try {
+      const manifest = asRecord(
+        JSON.parse(readFileSync(join(plugin.root, '.codex-plugin', 'plugin.json'), 'utf8')),
+      )
+      if (typeof manifest.skills !== 'string') continue
+      const dir = resolve(plugin.root, manifest.skills)
+      if (!isPathInside(plugin.root, dir)) continue
+      for (const skill of readSkillDir(dir, 'system').skills)
+        skills.push({
+          name: skill.name,
+          description: skill.description,
+          path: skill.path,
+          plugin: plugin.name,
+        })
+    } catch {}
+  }
+  return skills.sort((left, right) => left.name.localeCompare(right.name))
+}
+
 function readSkillDir(
   dir: string,
-  scope: 'user' | 'repo',
+  scope: 'user' | 'repo' | 'system',
 ): { skills: SkillMetadata[]; errors: Array<{ path: string; message: string }> } {
   const skills: SkillMetadata[] = []
   const errors: Array<{ path: string; message: string }> = []
@@ -81,7 +219,9 @@ function readSkillDir(
         name,
         description: frontmatter.description || '',
         ...(frontmatter.description ? { shortDescription: frontmatter.description } : {}),
-        path: skillPath,
+        // Codex points `path` at the manifest; the App opens it when the
+        // skill chip is clicked.
+        path: manifest,
         scope,
         enabled: true,
       })
@@ -100,25 +240,59 @@ const HOOK_EVENT_MAP: Record<string, string> = {
   PreCompact: 'preCompact',
   PostCompact: 'postCompact',
   SessionStart: 'sessionStart',
+  SessionEnd: 'sessionEnd',
   UserPromptSubmit: 'userPromptSubmit',
+  SubagentStart: 'subagentStart',
+  SubagentStop: 'subagentStop',
   Stop: 'stop',
+}
+
+export function codexHookEventName(claudeEvent: string): string | null {
+  return HOOK_EVENT_MAP[claudeEvent] ?? null
+}
+
+function hookSettingsFiles(cwd: string): Array<{ path: string; source: 'user' | 'project' }> {
+  // With the Claude Code config bridged and its hooks asked for, the hooks
+  // the adapter runs itself.
+  const bridged = bridgedClaudeConfigDir()
+  if (bridged && claudeHookScope() !== 'off')
+    return claudeHookFiles(cwd, bridged).map((path, index) => ({
+      path,
+      source: index === 0 ? 'user' : 'project',
+    }))
+  return [
+    { path: join(homedir(), '.claude', 'settings.json'), source: 'user' },
+    { path: join(cwd, '.claude', 'settings.json'), source: 'project' },
+    { path: join(cwd, '.claude', 'settings.local.json'), source: 'project' },
+  ]
+}
+
+// Where a running hook most likely came from: the first settings file that
+// configures its event. Plugin, managed and SDK hooks live elsewhere and
+// report `unknown`.
+export function claudeHookSource(
+  cwd: string,
+  claudeEvent: string,
+): { source: 'user' | 'project' | 'unknown'; sourcePath: string } {
+  for (const { path, source } of hookSettingsFiles(cwd)) {
+    if (!existsSync(path)) continue
+    try {
+      const matchers = asRecord(asRecord(JSON.parse(readFileSync(path, 'utf8'))).hooks)[claudeEvent]
+      if (Array.isArray(matchers) && matchers.length > 0) return { source, sourcePath: path }
+    } catch {
+      // hooks/list reports unreadable settings; a run just stays unattributed.
+    }
+  }
+  return { source: 'unknown', sourcePath: join(homedir(), '.claude', 'settings.json') }
 }
 
 export function listClaudeHooks(params: Record<string, unknown>): HooksListEntry[] {
   const roots = cwdsFromParams(params)
-  const userSources = [
-    { path: join(homedir(), '.claude', 'settings.json'), source: 'user' as const },
-  ]
   return roots.map((cwd) => {
-    const sources = [
-      ...userSources,
-      { path: join(cwd, '.claude', 'settings.json'), source: 'project' as const },
-      { path: join(cwd, '.claude', 'settings.local.json'), source: 'project' as const },
-    ]
     const hooks: HookMetadata[] = []
     const errors: Array<{ path: string; message: string }> = []
     let order = 0
-    for (const { path, source } of sources) {
+    for (const { path, source } of hookSettingsFiles(cwd)) {
       if (!existsSync(path)) continue
       let parsed: Record<string, unknown>
       try {

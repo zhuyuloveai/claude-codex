@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process'
+import { resolveRuntimeConfig } from './runtime-config.mjs'
 
 export interface ChrysModelOption {
   id: string
@@ -55,7 +56,5 @@ export function chrysModelOptions(): ChrysModelOption[] {
 }
 
 export function useChrysRuntime(): boolean {
-  if (process.env.CLAUDE_CODEX_MOCK === '1') return false
-  const explicit = process.env.CHRYS_CODEX_RUNTIME_TYPE ?? process.env.CLAUDE_CODEX_RUNTIME_TYPE
-  return !explicit || ['chrys', 'chrys-acp', 'acp'].includes(explicit.trim().toLowerCase())
+  return resolveRuntimeConfig().type === 'chrys-acp'
 }

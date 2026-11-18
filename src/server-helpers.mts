@@ -1,12 +1,19 @@
 import { type ChildProcess, execFile, spawn } from 'node:child_process'
 import { type FSWatcher, readFileSync, watch, writeFileSync } from 'node:fs'
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 import { promisify } from 'node:util'
+import { antigravityModelOptions, useAntigravityRuntime } from './antigravity-catalog.mjs'
+import type { ConfigEdit } from './app-settings.mjs'
 import { chrysModelOptions, useChrysRuntime } from './chrys-catalog.mjs'
+import type { AppSkill } from './claude-capabilities.mjs'
 import { callMcpTool, readMcpConfig, readMcpResource } from './mcp.mjs'
+import { stripQuietTurnHeartbeat } from './quiet-turns.mjs'
 import type { SessionStore } from './store.mjs'
+import { type AppToolNoteOptions, appToolAvailabilityNote } from './turn-context.mjs'
 import type {
+  ApprovalsReviewer,
   ClaudeRuntime,
+  CollaborationModeKind,
   FileUpdateChange,
   ImageInput,
   JsonRpcId,
@@ -15,6 +22,7 @@ import type {
   PermissionDecision,
   RpcPeer,
   RuntimeEvent,
+  RuntimeFailure,
   ThreadItem,
   ThreadRecord,
   ThreadTokenUsage,
@@ -47,6 +55,7 @@ import {
   resolveClaudeEffort,
   resolveClaudeModel,
   textFromInput,
+  toolOutputInput,
 } from './util.mjs'
 import { maybeCreateThreadWorktree } from './worktree.mjs'
 
@@ -62,48 +71,27 @@ export function stringOr(value: unknown, fallback: string): string {
   return typeof value === 'string' && value.length > 0 ? value : fallback
 }
 
-// Pull a human-readable line out of a raw Responses-API item. Items are
-// free-form JSON; common shapes include {type, content:[{type:'text', text}]}
-// for assistant/user turns and {type:'message', role, content} for chat
-// segments. Fall back to a stringified JSON snippet otherwise.
-export function summarizeInjectedItem(raw: unknown): string {
-  if (raw == null) return ''
-  if (typeof raw === 'string') return raw.slice(0, 1000)
-  if (typeof raw !== 'object') return String(raw).slice(0, 1000)
-  const rec = raw as Record<string, unknown>
-  const content = rec.content
-  if (Array.isArray(content)) {
-    const texts: string[] = []
-    for (const block of content) {
-      if (block && typeof block === 'object') {
-        const b = block as Record<string, unknown>
-        if (typeof b.text === 'string') texts.push(b.text)
-      }
-    }
-    if (texts.length > 0) return texts.join('\n').slice(0, 2000)
-  }
-  if (typeof rec.text === 'string') return rec.text.slice(0, 2000)
-  // Last-resort dump so something shows up in the transcript.
-  try {
-    return JSON.stringify(raw).slice(0, 500)
-  } catch {
-    return '[non-serializable item]'
-  }
-}
-
-export function configEdits(
-  params: Record<string, unknown>,
-): Array<{ keyPath: string; value: unknown }> {
+// The edits of config/value/write (one) or config/batchWrite (each of
+// `edits`), in order. Codex's mergeStrategy is replace unless it says upsert.
+export function configEdits(params: Record<string, unknown>): ConfigEdit[] {
+  const strategy = (value: unknown): ConfigEdit['mergeStrategy'] =>
+    value === 'upsert' ? 'upsert' : 'replace'
   if (Array.isArray(params.edits)) {
     return params.edits
       .map((edit) => {
         const rec = asRecord(edit)
-        return { keyPath: String(rec.keyPath ?? rec.key ?? ''), value: rec.value }
+        return {
+          keyPath: String(rec.keyPath ?? rec.key ?? ''),
+          value: rec.value,
+          mergeStrategy: strategy(rec.mergeStrategy),
+        }
       })
       .filter((edit) => edit.keyPath.length > 0)
   }
   const keyPath = String(params.keyPath ?? params.key ?? '')
-  return keyPath ? [{ keyPath, value: params.value }] : []
+  return keyPath
+    ? [{ keyPath, value: params.value, mergeStrategy: strategy(params.mergeStrategy) }]
+    : []
 }
 
 export function configLayerMetadata(): unknown {
@@ -120,6 +108,7 @@ export function allSelectableModelOptions(): Array<{
   description: string
   isDefault?: boolean
 }> {
+  if (useAntigravityRuntime()) return antigravityModelOptions()
   if (useChrysRuntime()) return chrysModelOptions()
   return [...claudeModelOptions(), ...codexProxyModelOptions()]
 }
@@ -144,8 +133,19 @@ export function normalizeSelectableModelId(value: string, fallback: string): str
   return defaultModel
 }
 
+// Codex: a request's collaborationMode "takes precedence over model,
+// reasoning_effort, and developer instructions". The App relies on it: a
+// turn/start that names a mode sends `model: null, effort: null` and puts the
+// picker's choice in collaborationMode.settings. An empty model or a null
+// effort there means "keep the current one".
+function collaborationSettings(params: Record<string, unknown>): Record<string, unknown> {
+  return asRecord(asRecord(params.collaborationMode).settings)
+}
+
 export function modelFromParams(params: Record<string, unknown>, fallback: string | null): string {
   const config = asRecord(params.config)
+  const modeModel = collaborationSettings(params).model
+  if (typeof modeModel === 'string' && modeModel.length > 0) return modeModel
   if (typeof params.model === 'string' && params.model.length > 0) return params.model
   if (typeof config.model === 'string' && config.model.length > 0) return config.model
   return fallback ?? ''
@@ -154,15 +154,84 @@ export function modelFromParams(params: Record<string, unknown>, fallback: strin
 export function reasoningEffortFromParams(
   params: Record<string, unknown>,
   fallback: string | null,
-): 'low' | 'medium' | 'high' | 'xhigh' | null {
+): 'low' | 'medium' | 'high' | 'xhigh' | 'max' | null {
   const config = asRecord(params.config)
+  const modeEffort = collaborationSettings(params).reasoning_effort
   const effort =
-    typeof params.effort === 'string'
-      ? params.effort
-      : typeof config.model_reasoning_effort === 'string'
-        ? config.model_reasoning_effort
-        : fallback
+    typeof modeEffort === 'string'
+      ? modeEffort
+      : typeof params.effort === 'string'
+        ? params.effort
+        : typeof config.model_reasoning_effort === 'string'
+          ? config.model_reasoning_effort
+          : fallback
   return normalizeCodexReasoningEffort(effort)
+}
+
+// The model and effort a turn/start's collaborationMode carries, lifted to
+// the top-level `model` / `effort` keys the runtime reads.
+export function collaborationModeSettings(params: Record<string, unknown>): {
+  model?: string
+  effort?: string
+} {
+  const settings = collaborationSettings(params)
+  return {
+    ...(typeof settings.model === 'string' && settings.model.length > 0
+      ? { model: settings.model }
+      : {}),
+    ...(typeof settings.reasoning_effort === 'string' ? { effort: settings.reasoning_effort } : {}),
+  }
+}
+
+// The mode a request's `collaborationMode` names, or null when it names none
+// (the thread then keeps its stored mode).
+export function collaborationModeFromParams(
+  params: Record<string, unknown>,
+): CollaborationModeKind | null {
+  const mode = asRecord(params.collaborationMode).mode
+  return mode === 'plan' || mode === 'default' ? mode : null
+}
+
+// The reviewer a request's `approvalsReviewer` names, or null when it names
+// none. Codex still accepts the older name of auto_review.
+export function approvalsReviewerFromParams(
+  params: Record<string, unknown>,
+): ApprovalsReviewer | null {
+  const reviewer = params.approvalsReviewer
+  if (reviewer === 'auto_review' || reviewer === 'guardian_subagent') return 'auto_review'
+  return reviewer === 'user' ? 'user' : null
+}
+
+// Codex `GuardianApprovalReviewAction` for the item of a reviewed call: what
+// the App's review card says was asked. Other items have no such action.
+export function autoReviewAction(item: ThreadItem, cwd: string): Record<string, unknown> | null {
+  if (item.type === 'commandExecution')
+    return { type: 'command', source: 'shell', command: item.command, cwd: item.cwd }
+  if (item.type === 'fileChange')
+    return { type: 'applyPatch', cwd, files: item.changes.map((change) => change.path) }
+  if (item.type === 'mcpToolCall')
+    return {
+      type: 'mcpToolCall',
+      server: item.server,
+      toolName: item.tool,
+      connectorId: null,
+      connectorName: null,
+      toolTitle: null,
+    }
+  return null
+}
+
+// Codex `CollaborationMode` for a thread, as thread/settings/updated and
+// thread/resume report it. The App adopts it as the composer's mode.
+export function collaborationModeEnvelope(thread: ThreadRecord): Record<string, unknown> {
+  return {
+    mode: thread.collaborationMode ?? 'default',
+    settings: {
+      model: thread.model,
+      reasoning_effort: thread.reasoningEffort,
+      developer_instructions: thread.developerInstructions,
+    },
+  }
 }
 
 export function numberOr(value: unknown, fallback: number): number {
@@ -174,6 +243,78 @@ export function commandArray(value: unknown): string[] {
   if (typeof value === 'string' && value.trim())
     return [process.env.SHELL || '/bin/sh', '-lc', value]
   return []
+}
+
+// A config value can hold credentials: an MCP server's environment and HTTP
+// headers, a bearer token, an API key, a token passed as a command argument
+// (`--header "Authorization: Bearer …"`), a password or secret path in a URL.
+// The debug log keeps every key name and the shape of the value, and none of
+// those values. Keys whose values can all be credentials (a server's `env`
+// and headers, a command's `args`, a provider's `query_params`) have every
+// value under them replaced; keys named like a credential have their own
+// value replaced; of a `url`, only the scheme and host are kept.
+const CREDENTIAL_HOLDER_KEY = /^(env|headers|http_headers|env_http_headers|args|query_params)$/i
+const CREDENTIAL_KEY = /token|secret|passw|api.?key|auth|cookie|credential|bearer|private.?key/i
+const REDACTED = '[redacted]'
+
+// `value`, written at `keyPath` (dotted, as in config/value/write) of the
+// config, as the debug log may show it.
+function redactConfigValue(keyPath: string, value: unknown): unknown {
+  const segments = keyPath.split('.')
+  if (
+    segments.some((segment) => CREDENTIAL_HOLDER_KEY.test(segment) || CREDENTIAL_KEY.test(segment))
+  )
+    return redactLeaves(value)
+  if (typeof value === 'string' && segments.at(-1) === 'url') return redactUrl(value)
+  if (Array.isArray(value)) return value.map((entry) => redactConfigValue('', entry))
+  if (value && typeof value === 'object')
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [key, redactConfigValue(key, entry)]),
+    )
+  return value
+}
+
+function redactLeaves(value: unknown): unknown {
+  if (value == null) return value
+  if (Array.isArray(value)) return value.map(redactLeaves)
+  if (typeof value === 'object')
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [key, redactLeaves(entry)]),
+    )
+  return REDACTED
+}
+
+// The user and password of a URL, its path (a per-user server URL often has
+// its secret there), its query and its fragment can each be a credential, so
+// only the scheme and host are kept. Text that does not parse as a URL is
+// replaced whole.
+function redactUrl(value: string): string {
+  try {
+    const url = new URL(value)
+    const user = url.username || url.password ? 'redacted@' : ''
+    const rest =
+      (url.pathname !== '' && url.pathname !== '/') || url.search || url.hash ? `/${REDACTED}` : ''
+    return `${url.protocol}//${user}${url.host}${rest}`
+  } catch {
+    return REDACTED
+  }
+}
+
+// What the debug log shows of a config write: config/value/write names one
+// key path, config/batchWrite a list of edits, and thread/start and the like
+// take a config table whose keys may be dotted paths.
+function redactConfigParams(rec: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...rec }
+  if (typeof rec.keyPath === 'string') out.value = redactConfigValue(rec.keyPath, rec.value)
+  if (Array.isArray(rec.edits))
+    out.edits = rec.edits.map((edit) => {
+      const fields = asRecord(edit)
+      return typeof fields.keyPath === 'string'
+        ? { ...fields, value: redactConfigValue(fields.keyPath, fields.value) }
+        : redactConfigValue('', edit)
+    })
+  if (rec.config && typeof rec.config === 'object') out.config = redactConfigValue('', rec.config)
+  return out
 }
 
 export function summarizeRpcParams(method: string, params: unknown): unknown {
@@ -242,7 +383,7 @@ export function summarizeRpcParams(method: string, params: unknown): unknown {
       turn: { id: turn.id, status: turn.status, items },
     }
   }
-  return rec
+  return redactConfigParams(rec)
 }
 
 export function reviewLabel(target: unknown): string {
@@ -256,6 +397,9 @@ export function reviewLabel(target: unknown): string {
   if (type === 'custom') return stringOr(rec.instructions, 'custom review')
   return 'uncommitted changes'
 }
+
+// Codex's exitedReviewMode text when the reviewer gave no answer.
+export const REVIEW_FALLBACK = 'Reviewer failed to output a response.'
 
 export function reviewPrompt(target: unknown): string {
   const label = reviewLabel(target)
@@ -271,11 +415,22 @@ export function reviewPrompt(target: unknown): string {
 export function compactSummary(thread: ThreadRecord, turns: TurnRecord[]): string {
   const snippets = turns
     .flatMap((turn) => turn.items)
-    .filter((item) => item.type === 'userMessage' || item.type === 'agentMessage')
+    .filter(
+      (item) =>
+        item.type === 'userMessage' ||
+        item.type === 'functionCallOutput' ||
+        item.type === 'agentMessage',
+    )
     .slice(-12)
     .map((item) => {
       if (item.type === 'userMessage') return 'User: ' + textFromInput(item.content).slice(0, 500)
-      if (item.type === 'agentMessage') return 'Assistant: ' + item.text.slice(0, 500)
+      if (item.type === 'functionCallOutput')
+        return 'User: ' + textFromInput(toolOutputInput(item.output)).slice(0, 500)
+      // The summary becomes a prompt, and Claude never sees the quiet-turn
+      // heartbeat.
+      // App rule: quiet-turn-heartbeat
+      if (item.type === 'agentMessage')
+        return 'Assistant: ' + stripQuietTurnHeartbeat(item.text).slice(0, 500)
       return ''
     })
     .filter(Boolean)
@@ -459,13 +614,14 @@ export function normalizePersonality(value: unknown): string | null {
   return null
 }
 
-// Codex v2 ReasoningEffort enum (top-level, used by collabAgentToolCall and
-// elsewhere). No serde(other) fallback — anything outside this set crashes
-// the App's deserializer (same trap as threadSource = ""). Pass any value
-// through here before emitting it on the wire.
+// Codex v2 ReasoningEffort as the App's schema knows it (top-level, used by
+// collabAgentToolCall and elsewhere). Anything outside this set, an empty
+// string included, crashes the App's deserializer (same trap as
+// threadSource = ""). Pass any value through here before emitting it on the
+// wire.
 export function normalizeReasoningEffortEnum(
   value: string | null | undefined,
-): 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | null {
+): 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | null {
   if (typeof value !== 'string') return null
   const v = value.trim()
   if (
@@ -474,10 +630,18 @@ export function normalizeReasoningEffortEnum(
     v === 'low' ||
     v === 'medium' ||
     v === 'high' ||
-    v === 'xhigh'
+    v === 'xhigh' ||
+    v === 'max'
   )
     return v
   return null
+}
+
+// The Agent tool's `effort` input on the Codex effort scale. Claude's `max`
+// sits above that scale, whose top is `xhigh`.
+export function subagentEffortFromInput(value: unknown): string | null {
+  if (value === 'max') return 'xhigh'
+  return typeof value === 'string' ? normalizeReasoningEffortEnum(value) : null
 }
 
 // Codex App's settings sheet writes the persistent reasoning-effort default
@@ -492,6 +656,246 @@ export function readConfigReasoningEffort(config: unknown): string | null {
   const direct = cfg.model_reasoning_effort ?? cfg['model_reasoning_effort']
   if (typeof direct === 'string' && direct.length > 0) return direct
   return null
+}
+
+// The Codex App shows a reasoning item only through its summary, so Claude's
+// thinking goes there unless the user turned summaries off, with
+// CLAUDE_CODEX_REASONING_VISIBLE=0 or Codex's model_reasoning_summary = "none".
+export function reasoningSummariesVisible(config: Record<string, unknown>): boolean {
+  return (
+    process.env.CLAUDE_CODEX_REASONING_VISIBLE !== '0' && config.model_reasoning_summary !== 'none'
+  )
+}
+
+// Codex's CodexErrorInfo: a camelCase code, or a one-key object for the codes
+// that carry the HTTP status.
+export type CodexErrorInfo = string | Record<string, { httpStatusCode: number | null }>
+
+// Codex's TurnError, as `error` notifications and failed turns carry it.
+export interface CodexTurnError {
+  message: string
+  codexErrorInfo: CodexErrorInfo | null
+  additionalDetails: string | null
+}
+
+// A TurnError that is only its message: a notice shown under a turn, or why
+// a subagent's own run ended. It has no Codex error code, since no request
+// failed.
+export function plainTurnError(message: string): CodexTurnError {
+  return { message, codexErrorInfo: null, additionalDetails: null }
+}
+
+// Why Claude Code refused to start (the SDK's SDKStartupFailureReason), told
+// as what fixes it. Only these messages are shown: the CLI's own text can
+// carry a proxy URL with its credentials. `retry` marks the failures a retry
+// can fix, where something could not be loaded or checked right now; the
+// others need a new sign-in, an administrator or a change on this machine.
+const STARTUP_FAILURES: Record<string, { retry: boolean; message: string }> = {
+  org_config_required_unavailable: {
+    retry: true,
+    message:
+      'Claude Code could not load the policy limits and settings your organization requires before a session starts. Check the network or proxy, then try again.',
+  },
+  remote_settings_required_unavailable: {
+    retry: true,
+    message:
+      'Claude Code could not load the managed settings your organization requires. Check the network or proxy, then try again.',
+  },
+  org_verify_failed: {
+    retry: true,
+    message:
+      "Claude Code could not verify your sign-in's organization. Check the network, then try again; if it keeps failing, sign in to Claude Code again.",
+  },
+  worktree_unverified: {
+    retry: true,
+    message: "Claude Code could not verify this session's worktree right now. Try again.",
+  },
+  org_config_refused: {
+    retry: false,
+    message:
+      "Anthropic refused your organization's policy limits and settings for this sign-in. Sign in to Claude Code again (claude /login), or ask an administrator to allow Claude Code for this account.",
+  },
+  gateway_signin_required: {
+    retry: false,
+    message: 'The Claude gateway ended this sign-in. Sign in to Claude Code again (claude /login).',
+  },
+  gateway_access_denied: {
+    retry: false,
+    message:
+      'The Claude gateway refused managed settings for this account. Ask an administrator for access.',
+  },
+  org_pin_api_key_conflict: {
+    retry: false,
+    message:
+      "Your organization's managed settings require a Claude sign-in, but an Anthropic API key or auth token is configured. Remove it from the adapter's environment and sign in to Claude Code (claude /login).",
+  },
+  org_pin_mismatch: {
+    retry: false,
+    message:
+      'This Claude sign-in belongs to an organization your managed settings do not allow. Sign in to Claude Code with an allowed account (claude /login).',
+  },
+  provider_not_allowed: {
+    retry: false,
+    message:
+      "Your organization's managed settings do not allow the API provider this session is set up for. Switch to an allowed provider.",
+  },
+  managed_settings_invalid: {
+    retry: false,
+    message:
+      'Claude Code could not use your managed settings: they cannot be read, name no organization, or leave no allowed model. Ask an administrator to fix them.',
+  },
+  proxy_invalid: {
+    retry: false,
+    message:
+      "A proxy setting in Claude Code's environment or settings is not a complete URL. Fix it, then try again.",
+  },
+  temp_dir_unusable: {
+    retry: false,
+    message:
+      "Claude Code's temporary directory is unsafe or could not be created. Check the system temporary directory and its permissions.",
+  },
+  cwd_unavailable: {
+    retry: false,
+    message:
+      "This thread's working directory was deleted, moved or cannot be read. Restore it, or start the thread in a folder that exists.",
+  },
+  shell_tool_missing: {
+    retry: false,
+    message:
+      'Claude Code found no shell to run commands with. Install Git for Windows (Git Bash), or turn on the PowerShell tool.',
+  },
+  session_held_by_background: {
+    retry: false,
+    message:
+      'This conversation is running as a Claude Code background session. Stop that session, then try again.',
+  },
+  worktree_resume_refused: {
+    retry: false,
+    message:
+      'Claude Code refused to resume this session: its worktree failed a safety check, or the resume started inside the worktree.',
+  },
+  cli_version_too_old: {
+    retry: false,
+    message:
+      'This Claude Code version is older than the minimum Anthropic requires. Update Claude Code.',
+  },
+  bypass_root: {
+    retry: false,
+    message:
+      'Full access (bypass permissions) cannot run as root. Run the adapter as another user, or choose another approval mode.',
+  },
+}
+
+function startupFailure(reason: string): { retry: boolean; message: string } {
+  const known = Object.hasOwn(STARTUP_FAILURES, reason) ? STARTUP_FAILURES[reason] : undefined
+  if (known) return known
+  const name = startupReasonName(reason)
+  return { retry: false, message: `Claude Code refused to start${name ? ` (${name})` : ''}.` }
+}
+
+// A reason is named only when it looks like one, as a reason newer than the
+// table above still would.
+function startupReasonName(reason: string): string | null {
+  return /^[a-z][a-z0-9_]{0,63}$/.test(reason) ? reason : null
+}
+
+// The Codex error code for a Claude failure. `retrying` describes a request
+// Claude will send again: Codex reports every such retry as a disconnected
+// stream with the HTTP status, except an overloaded API, which the App shows
+// as "Server is busy". Codes the App answers with ChatGPT account flows are
+// never used: usageLimitExceeded opens a plan upgrade card and cyberPolicy a
+// safety notice, and an authentication failure stays 'other' rather than
+// 'unauthorized'. A CLI that refused to start for a reason a retry can fix
+// is a failed connection, which the App offers to retry; any other refusal
+// is 'other', which it does not.
+// App rule: error-codes
+export function codexErrorInfo(
+  failure: RuntimeFailure | null | undefined,
+  retrying = false,
+): CodexErrorInfo {
+  if (failure?.startupFailure) {
+    return startupFailure(failure.startupFailure).retry
+      ? { httpConnectionFailed: { httpStatusCode: null } }
+      : 'other'
+  }
+  const terminalReason = failure?.terminalReason ?? null
+  const category = failure?.category ?? null
+  const status = failure?.status ?? null
+  if (status === 529 || category === 'overloaded') return 'serverOverloaded'
+  if (retrying) return { responseStreamDisconnected: { httpStatusCode: status } }
+  if (terminalReason === 'prompt_too_long') return 'contextWindowExceeded'
+  if (status === 429 || category === 'rate_limit') return 'rateLimitExceeded'
+  if (category === 'invalid_request' || status === 400) return 'badRequest'
+  if (category === 'server_error' || (status != null && status >= 500)) {
+    return 'internalServerError'
+  }
+  // Nothing answered the request: the connection itself failed.
+  const unanswered = status == null && (category == null || category === 'unknown')
+  if (unanswered && terminalReason === 'api_error') {
+    return { httpConnectionFailed: { httpStatusCode: null } }
+  }
+  return 'other'
+}
+
+// The line under an error that says what the API answered.
+function apiErrorDetails(failure: RuntimeFailure | null | undefined): string | null {
+  const parts: string[] = []
+  if (failure?.status != null) parts.push(`HTTP ${failure.status}`)
+  if (failure?.category && failure.category !== 'unknown') {
+    parts.push(failure.category.replaceAll('_', ' '))
+  }
+  return parts.length > 0 ? parts.join(' ') : null
+}
+
+// The `error` notification for a model request Claude will retry. The App
+// folds a run of them into one "Reconnecting n/m" row, but only when the
+// message has exactly this form.
+// App rule: reconnecting-errors
+export function retryTurnError(event: Extract<RuntimeEvent, { type: 'retrying' }>): CodexTurnError {
+  const failure = { terminalReason: null, category: event.category, status: event.status }
+  const cause = apiErrorDetails(failure) ?? 'no response'
+  const wait = event.delayMs == null ? null : Math.max(1, Math.round(event.delayMs / 1000))
+  return {
+    message: `Reconnecting... ${event.attempt}/${event.maxRetries}`,
+    codexErrorInfo: codexErrorInfo(failure, true),
+    additionalDetails: wait == null ? cause : `${cause}; retrying in ${wait}s`,
+  }
+}
+
+// An Error for a failed turn that carries its Codex error code to failTurn.
+// A CLI that refused to start is told by why, never by its own text.
+export function turnFailure(message: string, failure: RuntimeFailure | null | undefined): Error {
+  const reason = failure?.startupFailure
+  if (!reason) {
+    return Object.assign(new Error(message), {
+      codexErrorInfo: codexErrorInfo(failure),
+      additionalDetails: apiErrorDetails(failure),
+    })
+  }
+  const name = startupReasonName(reason)
+  return Object.assign(new Error(startupFailure(reason).message), {
+    codexErrorInfo: codexErrorInfo(failure),
+    additionalDetails: name ? `Claude Code startup failure: ${name}` : null,
+  })
+}
+
+// The Codex TurnError for whatever ended a turn. Errors turnFailure did not
+// build are 'other', as Codex reports an error it has no code for.
+export function turnErrorOf(error: unknown): CodexTurnError {
+  const carried =
+    typeof error === 'object' && error !== null
+      ? (error as { codexErrorInfo?: unknown; additionalDetails?: unknown })
+      : {}
+  const info = carried.codexErrorInfo
+  return {
+    message: error instanceof Error ? error.message : String(error),
+    codexErrorInfo:
+      typeof info === 'string' || (typeof info === 'object' && info !== null)
+        ? (info as CodexErrorInfo)
+        : 'other',
+    additionalDetails:
+      typeof carried.additionalDetails === 'string' ? carried.additionalDetails : null,
+  }
 }
 
 // Codex v2 `ThreadSource` is a strict 3-variant enum with no `serde(other)`
@@ -529,6 +933,32 @@ export function nullIfEmpty(value: string | null | undefined): string | null {
   return value === '' ? null : value
 }
 
+// Project params, checked the way Codex's typed params would be.
+export function projectName(value: unknown): string {
+  const name = typeof value === 'string' ? value.trim() : ''
+  if (!name) throw new Error('project name must not be empty')
+  return name
+}
+
+export function projectRoots(value: unknown): Array<{ path: string }> {
+  if (!Array.isArray(value)) throw new Error('project roots must be an array')
+  return value.map((root) => {
+    const path = asRecord(root).path
+    if (typeof path !== 'string' || !isAbsolute(path))
+      throw new Error(`project root must be an absolute path: ${String(path)}`)
+    return { path }
+  })
+}
+
+export function projectMetadata(value: unknown): Record<string, string> {
+  const metadata: Record<string, string> = {}
+  for (const [key, entry] of Object.entries(asRecord(value))) {
+    if (typeof entry !== 'string') throw new Error(`project metadata ${key} must be a string`)
+    metadata[key] = entry
+  }
+  return metadata
+}
+
 const desktopPresentationPrompt = [
   '# Desktop conversation and presentation',
   'Use Claude Desktop as the reference for conversational style: warm, direct, and thoughtful. Follow the intent of the request: discuss ideas and explain concepts when asked; carry out and verify work when asked to act.',
@@ -542,6 +972,36 @@ const desktopPresentationPrompt = [
   'Existing generated images can be embedded with Markdown image syntax and an absolute file path. Raw HTML, SVG, and React code are not automatically executable artifacts; do not promise an interactive artifact merely by emitting its source.',
 ].join('\n')
 
+// Claude Code loads skills only from its own folders, so the Codex App's
+// plugin skills are listed the way Codex lists skills: by name, description
+// and file, for Claude to read when a request calls for one.
+function appSkillsPrompt(skills: readonly AppSkill[]): string {
+  return [
+    '# Codex App skills',
+    "These skills come with the Codex App. Each is a folder holding a SKILL.md and the files it refers to. When a request matches a skill's description, read its SKILL.md in full with the Read tool before starting, then follow it, resolving the relative paths it mentions against its folder. Leave a skill unread when no request calls for it.",
+    ...skills.map((skill) => `- ${skill.name}: ${skill.description} (file: ${skill.path})`),
+  ].join('\n')
+}
+
+// The line the App renders a visualization from, and where to save it.
+// App rule: inline-visualizations
+function inlineVisualizationPrompt(dir: string): string {
+  return [
+    '# Inline visualizations',
+    'The Codex App renders an HTML fragment inside the conversation when your final reply has a line of its own, outside any code fence, of this form:',
+    '::codex-inline-vis{path="/absolute/path/to/name.html"}',
+    'Write the visualization content reference that the visualize skill describes in this form instead, adding mode="wide" only where the skill calls for wide mode.',
+    visualizationDirNote(dir),
+  ].join('\n')
+}
+
+// Where the App reads this conversation's visualization fragments from. A
+// side conversation keeps its parent's system prompt, so it gets this line
+// with its own directory in the turn prompt instead.
+export function visualizationDirNote(dir: string): string {
+  return `Save the visualization fragments for this conversation in ${dir}; the App reads them from there.`
+}
+
 // Assemble the per-thread system prompt addendum from Codex App's instruction
 // surface. Sidecar concatenates this onto Claude's default system prompt so
 // the user's project / developer / personality settings actually take effect.
@@ -550,13 +1010,28 @@ export function buildSystemPromptAddendum(input: {
   developerInstructions: string | null
   personality: string | null
   desktopPresentation?: boolean
+  // Codex App plugin skills Claude can run, and the thread's directory for
+  // inline visualizations when its visualize skill is among them.
+  appSkills?: readonly AppSkill[]
+  visualizationDir?: string | null
+  // AGENTS.md and the Claude Code files the CLI does not read itself.
+  projectInstructions?: string | null
+  // The App tools the thread has by another route.
+  appTools?: AppToolNoteOptions
 }): string | null {
   const sections: string[] = []
   if (input.desktopPresentation) sections.push(desktopPresentationPrompt)
+  if (input.appSkills?.length) sections.push(appSkillsPrompt(input.appSkills))
+  if (input.visualizationDir) sections.push(inlineVisualizationPrompt(input.visualizationDir))
+  const project = (input.projectInstructions ?? '').trim()
+  if (project) sections.push(project)
   const base = (input.baseInstructions ?? '').trim()
   if (base) sections.push(`# Project instructions\n${base}`)
   const dev = (input.developerInstructions ?? '').trim()
   if (dev) sections.push(`# Developer instructions\n${dev}`)
+  // App rule: app-tool-availability
+  const tools = input.desktopPresentation ? appToolAvailabilityNote(dev, input.appTools) : null
+  if (tools) sections.push(tools)
   const cue = personalityPromptCue(input.personality)
   if (cue) sections.push(cue)
   return sections.length > 0 ? sections.join('\n\n') : null
@@ -628,14 +1103,26 @@ export function emptyTokenBreakdown(): TokenUsageBreakdown {
   }
 }
 
+export function addTokenBreakdowns(breakdowns: Iterable<TokenUsageBreakdown>): TokenUsageBreakdown {
+  const sum = emptyTokenBreakdown()
+  for (const breakdown of breakdowns) {
+    sum.totalTokens += breakdown.totalTokens
+    sum.inputTokens += breakdown.inputTokens
+    sum.cachedInputTokens += breakdown.cachedInputTokens
+    sum.outputTokens += breakdown.outputTokens
+    sum.reasoningOutputTokens += breakdown.reasoningOutputTokens
+  }
+  return sum
+}
+
 // claude-agent-sdk's Task tool appends a fixed metadata trailer to the
 // subagent's tool_result content:
-//   `agentId: <hex> (use SendMessage with to: '<hex>' to continue this agent)`
-//   `<usage>total_tokens: N\ntool_uses: M\nduration_ms: K</usage>`
+//   `agentId: <hex> (use SendMessage with to: '<hex>', summary: ... to continue this agent)`
+//   `<usage>subagent_tokens: N\ntool_uses: M\nduration_ms: K</usage>`
 // Codex App renders neither natively — they just show as raw text after the
-// real result. Strip both from the visible body and surface the values via
-// agentNickname / token usage / metrics so the subagent timeline carries the
-// SDK-reported identity and cost.
+// real result. Strip both (and the hand-back frame around the report) from the
+// visible body and surface the values via agentNickname / token usage /
+// metrics so the subagent timeline carries the SDK-reported identity and cost.
 interface SubagentTrailer {
   cleanText: string
   agentId: string | null
@@ -692,8 +1179,9 @@ export function parseSubagentTrailer(text: string): SubagentTrailer {
   let agentId: string | null = null
   let usage: SubagentTrailer['usage'] = null
 
+  // CLI 2.1.283 counts `subagent_tokens`; older builds said `total_tokens`.
   const usageMatch = cleanText.match(
-    /<usage>\s*total_tokens:\s*(\d+)\s*\n\s*tool_uses:\s*(\d+)\s*\n\s*duration_ms:\s*(\d+)\s*<\/usage>\s*$/,
+    /<usage>\s*(?:subagent|total)_tokens:\s*(\d+)\s*\n\s*tool_uses:\s*(\d+)\s*\n\s*duration_ms:\s*(\d+)\s*<\/usage>\s*$/,
   )
   if (usageMatch) {
     usage = {
@@ -704,13 +1192,32 @@ export function parseSubagentTrailer(text: string): SubagentTrailer {
     cleanText = cleanText.slice(0, usageMatch.index).replace(/\s+$/, '')
   }
 
-  const agentMatch = cleanText.match(/\n?agentId:\s*([0-9a-f]{8,32})\b[^\n]*\s*$/i)
+  // A worktree agent's trailer lists its worktree after the agentId line.
+  const agentMatch = cleanText.match(
+    /\n?agentId:\s*([0-9a-f]{8,32})\b[^\n]*(?:\nworktree(?:Path|Branch):[^\n]*)*\s*$/i,
+  )
   if (agentMatch) {
     agentId = agentMatch[1] ?? null
     cleanText = cleanText.slice(0, agentMatch.index).replace(/\s+$/, '')
   }
 
-  return { cleanText, agentId, usage }
+  return { cleanText: unwrapSubagentHandback(cleanText), agentId, usage }
+}
+
+// CLI 2.1.283 frames a subagent's report for the parent model: a one-line
+// `[Subagent hand-back] ...` notice at column zero, then the report with every
+// line indented by two spaces. Harness notes, indented too, may sit above the
+// frame; they are for the model, so only the report is kept. A frame-like line
+// inside the report is indented, so the first one at column zero is the real one.
+function unwrapSubagentHandback(text: string): string {
+  const frame = /(?:^|\n)\[Subagent hand-back\][^\n]*(?:\n|$)/.exec(text)
+  if (!frame) return text
+  return text
+    .slice(frame.index + frame[0].length)
+    .split('\n')
+    .map((line) => (line.startsWith('  ') ? line.slice(2) : line))
+    .join('\n')
+    .replace(/\s+$/, '')
 }
 
 // Best-effort parse of a Claude Bash tool_result for the real shell exit
@@ -760,27 +1267,6 @@ export function parseExitCodeFromResult(content: unknown): number | null {
   return Number.isFinite(code) ? code : null
 }
 
-// Best-effort: when the WebSearch tool returns a result, sniff whether the
-// first result was an explicit page open vs a result list. Codex App's
-// `webSearch` ThreadItem renders the action badge accordingly.
-export function parseWebSearchAction(
-  query: string,
-  resultText: string,
-):
-  | { type: 'search'; query: string | null; queries: string[] | null }
-  | { type: 'openPage'; url: string | null }
-  | { type: 'findInPage'; pattern: string | null; url: string | null }
-  | { type: 'other' } {
-  // Codex v2 WebSearchAction variants are tagged but the inner fields are NOT
-  // optional in Rust — they're `Option<...>` with NO `#[serde(default)]`, so
-  // App rejects an item that ships a bare {type:'search'} (missing required
-  // fields). Always populate every field of the chosen variant, even if null.
-  if (!resultText) return { type: 'search', query: query || null, queries: null }
-  const urlMatch = resultText.match(/https?:\/\/[^\s)\]"'<]+/)
-  if (urlMatch && query) return { type: 'openPage', url: urlMatch[0] }
-  return { type: 'search', query: query || null, queries: null }
-}
-
 // Maps the raw Anthropic usage block carried on the Claude Agent SDK
 // ResultMessage onto the Codex `TokenUsageBreakdown` shape. Cache-creation
 // tokens count as input; Claude does not separate reasoning output tokens.
@@ -795,7 +1281,7 @@ export function tokenBreakdownFromClaudeUsage(usage: Record<string, unknown>): T
     inputTokens,
     cachedInputTokens: cacheRead,
     outputTokens,
-    reasoningOutputTokens: 0,
+    reasoningOutputTokens: num(usage.reasoning_output_tokens),
     totalTokens: inputTokens + cacheRead + outputTokens,
   }
 }
@@ -864,6 +1350,59 @@ export function normalizeDecision(response: unknown): PermissionDecision['decisi
     return 'acceptForSession'
   }
   return 'decline'
+}
+
+// Whether the App answered with "Allow similar commands" for the prefix the
+// card showed: an acceptWithExecpolicyAmendment decision carrying it.
+export function acceptsAmendment(response: unknown, prefix: string[] | null): boolean {
+  if (!prefix) return false
+  const choice = asRecord(asRecord(response).decision).acceptWithExecpolicyAmendment
+  const words = asRecord(choice).execpolicy_amendment
+  return (
+    Array.isArray(words) &&
+    words.length === prefix.length &&
+    words.every((word, index) => word === prefix[index])
+  )
+}
+
+// What an approval "for this session" covers: a shell command by its exact
+// text, an MCP tool as a whole (as Codex keys it by server and tool), any
+// other tool by its exact input.
+export function approvalSessionKey(toolName: string, input: Record<string, unknown>): string {
+  if (toolName === 'Bash') return JSON.stringify(['command', String(input.command ?? '')])
+  if (toolName.startsWith('mcp__')) return JSON.stringify(['mcp', toolName])
+  return JSON.stringify(['tool', toolName, input])
+}
+
+const APPROVAL_SUMMARY_KEYS = [
+  'url',
+  'file_path',
+  'notebook_path',
+  'path',
+  'skill',
+  'pattern',
+  'query',
+  'description',
+  'prompt',
+  'command',
+]
+
+// The line a command approval card shows for a tool that is not a shell
+// command (WebFetch, NotebookEdit, Skill, ...): the tool's name and the
+// input that says what it will touch.
+export function toolApprovalCommand(toolName: string, input: Record<string, unknown>): string {
+  const key = APPROVAL_SUMMARY_KEYS.find(
+    (name) => typeof input[name] === 'string' && (input[name] as string).trim(),
+  )
+  let detail = key ? String(input[key]) : ''
+  if (!detail && Object.keys(input).length > 0) {
+    try {
+      detail = JSON.stringify(input)
+    } catch {}
+  }
+  detail = detail.replace(/\s+/g, ' ').trim()
+  if (detail.length > 200) detail = `${detail.slice(0, 199)}…`
+  return detail ? `${toolName} ${detail}` : toolName
 }
 
 export function fileChangeFromTool(
