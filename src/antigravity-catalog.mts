@@ -5,6 +5,14 @@ import type { ClaudeEffort } from './claude-models.mjs'
 import { resolveRuntimeConfig } from './runtime-config.mjs'
 import { adapterHome } from './util.mjs'
 
+// ACP model variants are not ordered by reasoning intensity. The App renders
+// the supplied order directly as slider positions, so normalize both fresh
+// reports and previously persisted catalogs.
+function orderedEfforts(values: readonly unknown[]): ClaudeEffort[] {
+  const order: ClaudeEffort[] = ['low', 'medium', 'high', 'xhigh', 'max']
+  return order.filter((value) => values.includes(value))
+}
+
 export interface AntigravityModelOption {
   id: string
   sdkModel: string
@@ -72,9 +80,9 @@ export function noteAntigravityModels(session: Record<string, unknown>): void {
                   ? [suffix as ClaudeEffort]
                   : []
               })
-              if (supported.length) return supported
+              if (supported.length) return orderedEfforts(supported)
               const prior = antigravityModelOptions().find((entry) => entry.sdkModel === id)
-              return id === current ? efforts : (prior?.efforts ?? [])
+              return orderedEfforts(id === current ? efforts : (prior?.efforts ?? []))
             })(),
           },
         ]
@@ -99,7 +107,10 @@ export function antigravityModelOptions(): AntigravityModelOption[] {
       models.length &&
       models.every((model) => typeof model.id === 'string' && Array.isArray(model.efforts))
     )
-      return models as AntigravityModelOption[]
+      return (models as AntigravityModelOption[]).map((model) => ({
+        ...model,
+        efforts: orderedEfforts(model.efforts),
+      }))
   } catch {}
   return [
     {
