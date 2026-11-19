@@ -314,3 +314,28 @@ test('Antigravity auto-compacts only from explicit ACP context occupancy', async
     assert.equal(wire.filter((message) => message.method === 'session/prompt').length, 4)
   })
 })
+
+test('Antigravity prefers replay-free resume when the CLI advertises it', async () => {
+  await fixture('resume', async (runtime, home, log) => {
+    const events: RuntimeEvent[] = []
+    await runtime.runTurn(context(home, { claudeSessionId: 'agy-session' }), {
+      onEvent: (event) => {
+        events.push(event)
+      },
+      onPermissionRequest: async () => ({ decision: 'accept' }),
+    })
+    const wire = (await readFile(log, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+    assert.ok(wire.some((message) => message.method === 'session/resume'))
+    assert.ok(!wire.some((message) => message.method === 'session/load'))
+    assert.equal(
+      events
+        .filter((event) => event.type === 'text_delta')
+        .map((event) => event.delta)
+        .join(''),
+      'LIVE',
+    )
+  })
+})

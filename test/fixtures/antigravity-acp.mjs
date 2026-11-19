@@ -39,8 +39,18 @@ createInterface({ input: process.stdin }).on('line', (line) => {
   const message = JSON.parse(line)
   appendFileSync(log, `${line}\n`)
   if (message.method === 'initialize')
-    return reply(message.id, { protocolVersion: 1, agentCapabilities: { loadSession: true } })
-  if (message.method === 'session/new' || message.method === 'session/load') {
+    return reply(message.id, {
+      protocolVersion: 1,
+      agentCapabilities: {
+        loadSession: true,
+        ...(scenario === 'resume' ? { sessionCapabilities: { resume: {} } } : {}),
+      },
+    })
+  if (
+    message.method === 'session/new' ||
+    message.method === 'session/load' ||
+    message.method === 'session/resume'
+  ) {
     if (message.method === 'session/load')
       update({
         sessionUpdate: 'agent_message_chunk',

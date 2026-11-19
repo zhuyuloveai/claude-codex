@@ -64,6 +64,10 @@ ssh -o BatchMode=yes antigravity-local 'codex --version'
 
 ### 已实现
 
+- 恢复会话优先使用协商声明的 `session/resume`，不回放历史；仅对未声明 resume 的旧 CLI
+  保留 load 兼容路径。本机 1.5.11 的 load 会在返回响应后继续推送历史，因此只按加载响应
+  切换 live 标志不足以防止串入下一轮。修复由三轮真实记忆／输出隔离脚本
+  `scripts/smoke-antigravity-resume.mjs` 验证。
 - 真实模型目录及从低到高的思考等级；ACP 文本、思考、工具、命令／文件审批、diff、
   恢复、取消和 steering。模型 ID 带 `antigravity/`，避免 GPT-OSS 被误路由到 Codex。
 - App 动态工具通过每轮独立的 Unix socket MCP 桥往返 `item/tool/call`。目录 0700、

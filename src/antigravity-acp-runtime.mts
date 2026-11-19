@@ -211,16 +211,25 @@ export class AntigravityAcpRuntime implements ClaudeRuntime {
         }),
       )
       const capabilities = acpRecord(initialized.agentCapabilities)
-      if (sessionId && capabilities.loadSession !== true)
+      const sessionCapabilities = acpRecord(
+        capabilities.sessionCapabilities ?? capabilities.session_capabilities,
+      )
+      const canResume = Object.hasOwn(sessionCapabilities, 'resume')
+      if (sessionId && !canResume && capabilities.loadSession !== true)
         throw new Error(
           'This Antigravity CLI does not advertise session/load; cannot safely restore this chat.',
         )
       const session = acpRecord(
-        await client.request(sessionId ? 'session/load' : 'session/new', {
-          cwd: context.cwd,
-          mcpServers: [...acpMcpServers(context.mcpServers), ...(bridge ? [bridge.config] : [])],
-          ...(sessionId ? { sessionId } : {}),
-        }),
+        // resume restores context without replay. load can stream old events
+        // after its response, past the live gate and into the next turn.
+        await client.request(
+          sessionId ? (canResume ? 'session/resume' : 'session/load') : 'session/new',
+          {
+            cwd: context.cwd,
+            mcpServers: [...acpMcpServers(context.mcpServers), ...(bridge ? [bridge.config] : [])],
+            ...(sessionId ? { sessionId } : {}),
+          },
+        ),
       )
       sessionId = String(session.sessionId ?? sessionId)
       if (!sessionId) throw new Error('Antigravity ACP returned no session id')
