@@ -1,0 +1,22 @@
+docs/antigravity-local.md
+  h_3a8df3cf4e70f0 67-70
+scripts/smoke-antigravity-resume.mjs
+  h_3a8df3cf4e70f0 1-59
+src/antigravity-acp-runtime.mts
+  h_3a8df3cf4e70f0 214-218,223-232
+test/antigravity-acp.test.mts
+  h_3a8df3cf4e70f0 317-341
+test/fixtures/antigravity-acp.mjs
+  h_3a8df3cf4e70f0 42-53
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.22",
+  "base_commit_sha": "0b4e8ac8153c3b26e0a93b5827419c4513a88b2d",
+  "prompts": {},
+  "humans": {
+    "h_3a8df3cf4e70f0": {
+      "author": "朱宇 <zhuyu@zhuyudeMacBook-Air.local>"
+    }
+  }
+}
