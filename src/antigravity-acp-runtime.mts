@@ -272,22 +272,28 @@ export class AntigravityAcpRuntime implements ClaudeRuntime {
         throw new Error('Antigravity ACP does not advertise image input')
       for (const image of context.imageInputs)
         prompt.push(await antigravityImage(image, abort.signal))
-      let result = acpRecord(
-        await client.request('session/prompt', { sessionId, prompt }, 2 * 60 * 60_000),
-      )
+      let result = acpRecord(await client.request('session/prompt', { sessionId, prompt }, 0))
       await Promise.all(active.steering)
       // A prompt boundary is not task completion: ACP can return while tools
       // are still running. Keep this process and its bridge alive and require
       // terminal tool evidence before reporting success to the desktop.
-      for (let continuation = 0; result.stopReason === 'end_turn'; continuation++) {
+      let continuation = 0
+      while (result.stopReason === 'end_turn') {
         if (abort.signal.aborted) break
-        await delay(250, undefined, { signal: abort.signal })
+        await delay(continuation === 0 ? 250 : Math.min(30_000, continuation * 1000), undefined, {
+          signal: abort.signal,
+        })
         const pending = [...tools].filter(([, tool]) => !tool.ended)
-        if (!pending.length) break
-        if (continuation >= 8)
-          throw new Error(
-            'Antigravity ended repeatedly with unfinished tools; task completion is unverified',
-          )
+        const receipts = []
+        const watchUntil = Date.now() + 30_000
+        while (bridge?.backgroundTasks.pendingCount && Date.now() < watchUntil) {
+          receipts.push(...(await bridge.backgroundTasks.collect()))
+          if (!bridge.backgroundTasks.pendingCount) break
+          await delay(1000, undefined, { signal: abort.signal })
+        }
+        const background = bridge?.backgroundTasks.pendingTasks ?? []
+        if (!pending.length && !receipts.length && !background.length) break
+        continuation++
         await handlers.onEvent({
           type: 'notice',
           level: 'info',
@@ -301,11 +307,11 @@ export class AntigravityAcpRuntime implements ClaudeRuntime {
               prompt: [
                 {
                   type: 'text',
-                  text: `The authorized task is not complete. These tool calls have no terminal result: ${JSON.stringify(pending.map(([id, tool]) => ({ id, name: tool.name })))}. Wait for or inspect their existing execution handles, collect actual results, and finish the originally requested work. Do not restart commands or duplicate side effects. Do not end with a promise to follow up. If continuation is impossible, explicitly report the blocker and unverified work.`,
+                  text: `Registered background jobs still awaiting receipts: ${JSON.stringify(background)}. Check their existing runners and logs; if not launched yet, finish the authorized launch. Do not duplicate running work. If a runner has failed before writing its receipt, verify the failure and write a nonzero exitCode receipt; never fabricate success. A long running job is not a failure. Background task terminal receipts: ${JSON.stringify(receipts)}. Inspect their logs and report failures honestly. The authorized task is not complete until required results are verified. These tool calls have no terminal result: ${JSON.stringify(pending.map(([id, tool]) => ({ id, name: tool.name })))}. Wait for or inspect their existing execution handles, collect actual results, and finish the originally requested work. Do not restart commands or duplicate side effects. Do not end with a promise to follow up. If continuation is impossible, explicitly report the blocker and unverified work.`,
                 },
               ],
             },
-            2 * 60 * 60_000,
+            0,
           ),
         )
       }
@@ -368,7 +374,7 @@ export class AntigravityAcpRuntime implements ClaudeRuntime {
         sessionId: active.sessionId,
         prompt: [{ type: 'text', text: prompt }],
       },
-      2 * 60 * 60_000,
+      0,
     )
     // Keep errors attached until runTurn awaits them; no unhandled rejection.
     void request.catch(() => {})

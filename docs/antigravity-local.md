@@ -192,8 +192,8 @@ launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/ai.antigravity.codex-adapt
 ACP `end_turn` is no longer treated as successful task completion while an
 observed tool lacks a terminal result. The adapter keeps the ACP process and
 MCP bridge alive and continues the same session, instructing it to inspect
-existing execution handles without restarting commands. Eight continuations
-are allowed; unresolved work then fails explicitly rather than claiming success.
+existing execution handles without restarting commands. There is no fixed continuation-count or session/prompt duration limit. Retries
+back off to 30 seconds; cancellation and transport errors still terminate work.
 Cancellation and non-success stop reasons do not start automatic continuations.
 Desktop instructions require a self-contained final answer and waiting for
 background checks instead of promising a later reply.
@@ -205,3 +205,26 @@ command, verifies its result file, and requires every observed tool to settle
 before the successful completion event. Reports are written under `/tmp`.
 This guard tracks ACP tool lifecycle evidence; it cannot prove arbitrary
 business objectives or detect detached work that the backend never exposes.
+
+
+Detached finite commands must first call `register_background_task`. It returns
+an unpredictable task ID and private receipt path. Launch via the normal
+permission-checked tool; the background runner writes `{taskId, exitCode}` by
+atomic rename only after the real command exits. The adapter polls the receipt locally and periodically resumes the model to
+inspect the existing runner; on completion it resumes the same session to
+inspect logs and report the result. Failure receipts are forwarded as failure evidence, never success.
+Use `ANTIGRAVITY_SMOKE_DETACHED=1 node scripts/smoke-antigravity-completion.mjs`
+for the real nohup smoke. Existing unregistered jobs and indefinite services
+are not auto-discovered. Tracking runs while the adapter turn remains alive;
+a host/adapter restart does not automatically resume these in-memory watches.
+
+In Full access, prefer `start_background_task`: after the usual permission and
+deny-rule checks, the adapter starts its own detached runner with a separate
+log and atomic exit receipt. It does not rely on a model-authored receipt or
+CLI-owned shell lifetime. Cancellation terminates the managed process group.
+External registered runners are inspected every 30 seconds if no receipt
+arrives, so a launch failure does not leave the adapter waiting silently.
+
+Managed commands must themselves await their workload (no nested fire-and-forget
+`&`/nohup). The receipt proves that command exited; application-level success
+still requires inspecting its exit code, log and requested artifacts.

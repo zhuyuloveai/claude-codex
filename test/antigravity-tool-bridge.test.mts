@@ -199,7 +199,8 @@ test('ACP HTTP MCP forwarding uses configured headers and checks approval before
     async () => ({}),
   )
   try {
-    const name = bridge.names[0]
+    const name = bridge.names.find((name) => name.endsWith('echo'))
+    assert.ok(name)
     assert.equal(
       ((await client.request('tools/call', { name, arguments: {} })) as { isError: boolean })
         .isError,

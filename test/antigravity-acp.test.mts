@@ -363,18 +363,32 @@ test('unfinished tools continue in the same session before successful completion
   })
 })
 
-test('persistently unfinished tools cannot report successful completion', async () => {
+test('unfinished tracking remains cancellable rather than reporting success', async () => {
   await fixture('stuck', async (runtime, home) => {
     const events: RuntimeEvent[] = []
-    await assert.rejects(
-      runtime.runTurn(context(home), {
-        onEvent: (event) => {
-          events.push(event)
-        },
-        onPermissionRequest: async () => ({ decision: 'decline' }),
-      }),
-      /completion is unverified/,
-    )
+    const run = runtime.runTurn(context(home), {
+      onEvent: (event) => {
+        events.push(event)
+      },
+      onPermissionRequest: async () => ({ decision: 'decline' }),
+    })
+    await delay(600)
+    await runtime.stop()
+    await assert.rejects(run)
     assert.ok(!events.some((e) => e.type === 'completed' && e.success))
+  })
+})
+
+test('long tasks survive more than eight continuations', async () => {
+  await fixture('long', async (runtime, home, log) => {
+    await runtime.runTurn(context(home), {
+      onEvent: () => {},
+      onPermissionRequest: async () => ({ decision: 'decline' }),
+    })
+    const wire = (await readFile(log, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+    assert.equal(wire.filter((e) => e.method === 'session/prompt').length, 10)
   })
 })

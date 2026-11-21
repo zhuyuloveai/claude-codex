@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { createInterface } from 'node:readline'
 import { fileURLToPath } from 'node:url'
 import { acpRecord } from './acp-process.mjs'
+import { AntigravityBackgroundTasks } from './antigravity-background.mjs'
 import { antigravityToolSchema } from './antigravity-tool-schema.mjs'
 import { askRuleCovers } from './ask-rules.mjs'
 import { dynamicToolCallResult } from './dynamic-tools.mjs'
@@ -60,6 +61,49 @@ export async function antigravityToolBridge(
       },
     })
   }
+  const backgroundTasks = new AntigravityBackgroundTasks()
+  if (!context.planMode && context.sandboxMode === 'danger-full-access')
+    add({
+      name: 'start_background_task',
+      description:
+        'Start a finite background shell command under adapter tracking. Prefer this over nohup or shell &. Returns immediately with taskId, logPath and receiptPath; an independent runner writes the actual exit code when the command exits. The adapter keeps this turn open and resumes you to read logs and verify results. Do not use for permanent servers. User cancellation terminates this runner. Available in Full access only; execution still requires approval.',
+      inputSchema: schema({ command: string }, ['command']),
+      call: async (args) => {
+        const input = { command: String(args.command) }
+        if (!input.command.trim()) throw new Error('Empty command')
+        if (
+          (context.disallowedTools ?? []).some((rule) =>
+            askRuleCovers(rule, 'Bash', input, context.cwd),
+          )
+        )
+          throw new Error('Background command denied by rule')
+        const decision = await handlers.onPermissionRequest({
+          type: 'permission_request',
+          requestId: randomUUID(),
+          toolUseId: randomUUID(),
+          toolName: 'Bash',
+          input,
+          reason: 'Start tracked background command',
+        })
+        signal.throwIfAborted()
+        if (!['accept', 'acceptForSession'].includes(decision.decision))
+          throw new Error('Background command not approved')
+        return textResult(async () =>
+          JSON.stringify(await backgroundTasks.start(input.command, context.cwd, signal)),
+        )
+      },
+    })
+  if (!context.planMode && context.sandboxMode !== 'read-only')
+    add({
+      name: 'register_background_task',
+      description:
+        'Before launching a detached finite job (nohup, shell &, remote job watcher), register it here. Returns taskId and receiptPath. Launch using your normal permission-checked execution tool; in that same runner, wait for the actual job and write JSON {taskId, exitCode} atomically to receiptPath ONLY after the real job finishes. Capture its actual exit code, including failure. Never write success merely because launch succeeded. If launch fails, write a failure receipt. Keep output in a separate log for inspection. The adapter waits for the receipt and resumes you automatically. Do not register permanent services. This tool registers tracking only; it does not launch a process.',
+      inputSchema: schema({ description: string }, ['description']),
+      call: async (args) =>
+        textResult(async () =>
+          JSON.stringify(await backgroundTasks.register(String(args.description))),
+        ),
+    })
   if (!context.planMode && context.sandboxMode !== 'read-only' && handlers.onDynamicToolCall) {
     for (const server of context.dynamicTools ?? [])
       for (const tool of server.tools) {
@@ -499,6 +543,7 @@ export async function antigravityToolBridge(
       env: [],
     },
     names: [...registry.keys()],
+    backgroundTasks,
     async close() {
       for (const socket of sockets) socket.destroy()
       await new Promise<void>((resolve) => server.close(() => resolve()))

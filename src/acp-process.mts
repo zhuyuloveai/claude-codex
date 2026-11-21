@@ -31,7 +31,7 @@ export class AcpProcess {
     {
       resolve(value: unknown): void
       reject(error: Error): void
-      timer: NodeJS.Timeout
+      timer: NodeJS.Timeout | undefined
     }
   >()
   private nextId = 1
@@ -97,10 +97,13 @@ export class AcpProcess {
     if (this.closed) throw new Error('ACP process is closed')
     const id = this.nextId++
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id)
-        reject(new Error(`ACP request timed out: ${method}`))
-      }, timeoutMs)
+      const timer =
+        timeoutMs > 0
+          ? setTimeout(() => {
+              this.pending.delete(id)
+              reject(new Error(`ACP request timed out: ${method}`))
+            }, timeoutMs)
+          : undefined
       this.pending.set(id, { resolve, reject, timer })
       this.write({ jsonrpc: '2.0', id, method, params })
     })

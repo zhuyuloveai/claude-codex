@@ -34,6 +34,7 @@ const configOptions = [
     options: [{ value: 'default' }, { value: 'plan' }],
   },
 ]
+let promptCount = 0
 let promptId
 createInterface({ input: process.stdin }).on('line', (line) => {
   const message = JSON.parse(line)
@@ -60,7 +61,8 @@ createInterface({ input: process.stdin }).on('line', (line) => {
   }
   if (message.method === 'session/set_config_option') return reply(message.id, { configOptions })
   if (message.method === 'session/prompt') {
-    if (scenario === 'unfinished' || scenario === 'stuck') {
+    if (scenario === 'unfinished' || scenario === 'stuck' || scenario === 'long') {
+      promptCount++
       if (!promptId) {
         promptId = message.id
         update({
@@ -71,7 +73,7 @@ createInterface({ input: process.stdin }).on('line', (line) => {
           rawInput: { CommandLine: 'slow check' },
           status: 'in_progress',
         })
-      } else if (scenario === 'unfinished') {
+      } else if (scenario === 'unfinished' || (scenario === 'long' && promptCount > 9)) {
         update({
           sessionUpdate: 'tool_call_update',
           toolCallId: 'slow-1',
