@@ -1,3 +1,4 @@
+import { setTimeout as delay } from 'node:timers/promises'
 import { type AcpMessage, AcpProcess, acpRecord, acpText } from './acp-process.mjs'
 import {
   acpConfigOptions,
@@ -271,10 +272,43 @@ export class AntigravityAcpRuntime implements ClaudeRuntime {
         throw new Error('Antigravity ACP does not advertise image input')
       for (const image of context.imageInputs)
         prompt.push(await antigravityImage(image, abort.signal))
-      const result = acpRecord(
+      let result = acpRecord(
         await client.request('session/prompt', { sessionId, prompt }, 2 * 60 * 60_000),
       )
       await Promise.all(active.steering)
+      // A prompt boundary is not task completion: ACP can return while tools
+      // are still running. Keep this process and its bridge alive and require
+      // terminal tool evidence before reporting success to the desktop.
+      for (let continuation = 0; result.stopReason === 'end_turn'; continuation++) {
+        if (abort.signal.aborted) break
+        await delay(250, undefined, { signal: abort.signal })
+        const pending = [...tools].filter(([, tool]) => !tool.ended)
+        if (!pending.length) break
+        if (continuation >= 8)
+          throw new Error(
+            'Antigravity ended repeatedly with unfinished tools; task completion is unverified',
+          )
+        await handlers.onEvent({
+          type: 'notice',
+          level: 'info',
+          message: `Continuing to verify ${pending.length} unfinished tool(s).`,
+        })
+        result = acpRecord(
+          await client.request(
+            'session/prompt',
+            {
+              sessionId,
+              prompt: [
+                {
+                  type: 'text',
+                  text: `The authorized task is not complete. These tool calls have no terminal result: ${JSON.stringify(pending.map(([id, tool]) => ({ id, name: tool.name })))}. Wait for or inspect their existing execution handles, collect actual results, and finish the originally requested work. Do not restart commands or duplicate side effects. Do not end with a promise to follow up. If continuation is impossible, explicitly report the blocker and unverified work.`,
+                },
+              ],
+            },
+            2 * 60 * 60_000,
+          ),
+        )
+      }
       for (const [id, tool] of tools) {
         if (!tool.ended)
           await handlers.onEvent({

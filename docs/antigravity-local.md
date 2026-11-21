@@ -186,3 +186,22 @@ launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/ai.antigravity.codex-adapt
 这只停止 Antigravity 后端。完整撤销时移除 SSH config 与 `.zshenv` 中标记为
 `antigravity codex` 的区块和对应 authorized_keys 行；不要覆盖此后新增的其他配置。
 旧 Chrys 发布目录和连接保持原样。
+
+### Unfinished-tool completion guard
+
+ACP `end_turn` is no longer treated as successful task completion while an
+observed tool lacks a terminal result. The adapter keeps the ACP process and
+MCP bridge alive and continues the same session, instructing it to inspect
+existing execution handles without restarting commands. Eight continuations
+are allowed; unresolved work then fails explicitly rather than claiming success.
+Cancellation and non-success stop reasons do not start automatic continuations.
+Desktop instructions require a self-contained final answer and waiting for
+background checks instead of promising a later reply.
+
+Regression: `node --test dist/test/antigravity-acp.test.mjs` covers early
+completion followed by a terminal result, and repeated unresolved completion.
+Real smoke: `node scripts/smoke-antigravity-completion.mjs` runs a 35-second
+command, verifies its result file, and requires every observed tool to settle
+before the successful completion event. Reports are written under `/tmp`.
+This guard tracks ACP tool lifecycle evidence; it cannot prove arbitrary
+business objectives or detect detached work that the backend never exposes.

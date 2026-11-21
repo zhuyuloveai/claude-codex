@@ -339,3 +339,42 @@ test('Antigravity prefers replay-free resume when the CLI advertises it', async 
     )
   })
 })
+
+test('unfinished tools continue in the same session before successful completion', async () => {
+  await fixture('unfinished', async (runtime, home, log) => {
+    const events: RuntimeEvent[] = []
+    await runtime.runTurn(context(home), {
+      onEvent: (event) => {
+        events.push(event)
+      },
+      onPermissionRequest: async () => ({ decision: 'decline' }),
+    })
+    const terminal = events.findIndex(
+      (e) => e.type === 'tool_result' && e.content === 'CHECK_FINISHED',
+    )
+    const completed = events.findIndex((e) => e.type === 'completed' && e.success)
+    assert.ok(terminal >= 0 && completed > terminal)
+    const wire = (await readFile(log, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line))
+    assert.equal(wire.filter((e) => e.method === 'session/prompt').length, 2)
+    assert.equal(wire.filter((e) => e.method === 'session/new').length, 1)
+  })
+})
+
+test('persistently unfinished tools cannot report successful completion', async () => {
+  await fixture('stuck', async (runtime, home) => {
+    const events: RuntimeEvent[] = []
+    await assert.rejects(
+      runtime.runTurn(context(home), {
+        onEvent: (event) => {
+          events.push(event)
+        },
+        onPermissionRequest: async () => ({ decision: 'decline' }),
+      }),
+      /completion is unverified/,
+    )
+    assert.ok(!events.some((e) => e.type === 'completed' && e.success))
+  })
+})

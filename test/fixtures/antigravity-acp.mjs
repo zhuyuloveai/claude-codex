@@ -60,6 +60,32 @@ createInterface({ input: process.stdin }).on('line', (line) => {
   }
   if (message.method === 'session/set_config_option') return reply(message.id, { configOptions })
   if (message.method === 'session/prompt') {
+    if (scenario === 'unfinished' || scenario === 'stuck') {
+      if (!promptId) {
+        promptId = message.id
+        update({
+          sessionUpdate: 'tool_call',
+          toolCallId: 'slow-1',
+          kind: 'execute',
+          title: 'slow check',
+          rawInput: { CommandLine: 'slow check' },
+          status: 'in_progress',
+        })
+      } else if (scenario === 'unfinished') {
+        update({
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'slow-1',
+          status: 'completed',
+          content: [{ type: 'text', text: 'CHECK_FINISHED' }],
+        })
+        update({
+          sessionUpdate: 'agent_message_chunk',
+          content: { type: 'text', text: 'Verified completion' },
+        })
+      }
+      return reply(message.id, { stopReason: 'end_turn' })
+    }
+
     if (scenario === 'crash') {
       process.stderr.write('fixture process failure')
       process.exit(7)
